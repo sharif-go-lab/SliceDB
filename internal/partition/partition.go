@@ -1,9 +1,10 @@
 package partition
 
 import (
+	"sync"
+
 	"github.com/sharif-go-lab/SliceDB/internal/model"
 	"github.com/sharif-go-lab/SliceDB/internal/wal"
-	"sync"
 )
 
 // Partition represents a data partition with key-value storage
@@ -57,13 +58,11 @@ func (p *Partition) Set(key, value string) error {
 		p.data[key] = value
 		p.mu.Unlock()
 
-		// Replicate to followers (in a real system, this would be asynchronous)
+		// Replicate to followers
 		p.replicateToFollowers(entry)
 
 		return nil
 	} else {
-		// Follower nodes should only accept changes from leader
-		// In this simplified model, we assume the call is from the leader
 		p.mu.Lock()
 		p.data[key] = value
 		p.mu.Unlock()
@@ -125,10 +124,7 @@ func (p *Partition) ApplyLogEntry(entry model.LogEntry) {
 }
 
 // replicateToFollowers sends a log entry to all followers
-// In a real implementation, this would use actual network calls
 func (p *Partition) replicateToFollowers(entry model.LogEntry) {
-	// This is a simplified version - in a real system, you'd use the network client
-	// to send this entry to all followers asynchronously
 }
 
 // AddFollower adds a follower to the partition

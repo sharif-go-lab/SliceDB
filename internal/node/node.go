@@ -27,13 +27,13 @@ type Node struct {
 }
 
 // NewNode creates a new database node
-func NewNode(id, address, controllerAddr string) *Node {
+func NewNode(id, address, controllerAddr string, partitionCount int) *Node {
 	node := &Node{
 		ID:             id,
 		Address:        address,
 		ControllerAddr: controllerAddr,
 		partitions:     make(map[int]*partition.Partition),
-		partitionCount: 10, // Default partition count
+		partitionCount: partitionCount,
 		networkClient:  network.NewClient(),
 	}
 

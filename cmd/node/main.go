@@ -11,6 +11,7 @@ func main() {
 	// Command line flags
 	id := flag.String("id", "", "Node ID")
 	addr := flag.String("addr", ":8081", "Node address")
+	partitionCount := flag.Int("partitions", 10, "Number of partitions")
 	controllerAddr := flag.String("controller", "localhost:8080", "Controller address")
 	flag.Parse()
 
@@ -19,8 +20,8 @@ func main() {
 	}
 
 	// Create and start node
-	n := node.NewNode(*id, *addr, *controllerAddr)
-	log.Printf("Starting node %s at %s, controller at %s", *id, *addr, *controllerAddr)
+	n := node.NewNode(*id, *addr, *controllerAddr, *partitionCount)
+	log.Printf("Starting node %s at %s, controller at %s with %d partitions", *id, *addr, *controllerAddr, *partitionCount)
 
 	if err := n.Start(); err != nil {
 		log.Fatalf("Node error: %v", err)

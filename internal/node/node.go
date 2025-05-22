@@ -72,10 +72,7 @@ func (n *Node) registerWithController() error {
 		"address": n.Address,
 	}
 
-	var response map[string]interface{}
-	err := n.networkClient.Post(registerURL, data, &response)
-
-	return err
+	return n.networkClient.Post(registerURL, data, nil)
 }
 
 // startHeartbeat begins sending periodic heartbeats to the controller

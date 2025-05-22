@@ -1,0 +1,71 @@
+version: '3'
+
+services:
+  controller:
+    build: .
+    command: ["./controller", "-addr=:8080", "-partitions=10", "-replication=3"]
+    ports:
+      - "8080:8080"
+    networks:
+      - sliceDB-network
+    healthcheck:
+      test: curl -f http://localhost:8080/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  node1:
+    build: .
+    command: ["./node", "-id=node1", "-addr=:8081", "-controller=controller:8080"]
+    ports:
+      - "8081:8081"
+    depends_on:
+      controller:
+        condition: service_healthy
+    networks:
+      - sliceDB-network
+    healthcheck:
+      test: curl -f http://localhost:8080/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  node2:
+    build: .
+    command: ["./node", "-id=node2", "-addr=:8082", "-controller=controller:8080"]
+    ports:
+      - "8082:8082"
+    depends_on:
+      controller:
+        condition: service_healthy
+    networks:
+      - sliceDB-network
+    healthcheck:
+      test: curl -f http://localhost:8080/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  node3:
+    build: .
+    command: ["./node", "-id=node3", "-addr=:8083", "-controller=controller:8080"]
+    ports:
+      - "8083:8083"
+    depends_on:
+      controller:
+        condition: service_healthy
+    networks:
+      - sliceDB-network
+    healthcheck:
+      test: curl -f http://localhost:8080/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+networks:
+  sliceDB-network:
+    driver: bridge

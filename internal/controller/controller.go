@@ -163,14 +163,12 @@ func (c *Controller) handleFailover(unhealthyNodeIDs []string) {
 // rebalancePartitions distributes partitions among available nodes
 func (c *Controller) rebalancePartitions() {
 	// Get healthy nodes
-	c.mu.RLock()
 	healthyNodes := make([]string, 0)
-	for id, node := range c.nodes {
+	for _, node := range c.getNodes() {
 		if node.Status == model.NodeStatusHealthy {
-			healthyNodes = append(healthyNodes, id)
+			healthyNodes = append(healthyNodes, node.ID)
 		}
 	}
-	c.mu.RUnlock()
 
 	if len(healthyNodes) == 0 {
 		log.Printf("No healthy nodes available for rebalancing")
@@ -178,8 +176,7 @@ func (c *Controller) rebalancePartitions() {
 	}
 
 	// Assign partitions to nodes
-	c.mu.RLock()
-	for partitionID, partition := range c.partitions {
+	for _, partition := range c.getPartitions() {
 		// Ensure we have enough followers
 		currentFollowers := len(partition.FollowerIDs)
 		desiredFollowers := c.replicationFactor
@@ -202,23 +199,21 @@ func (c *Controller) rebalancePartitions() {
 
 			// Add new followers
 			for i := 0; neededFollowers > 0 && i < len(availableNodes); i++ {
-				node := c.nodes[availableNodes[i]]
+				node, _ := c.getNode(availableNodes[i])
 
-				c.mu.RUnlock()
 				if err := model.RetryJob(func() error {
-					return c.notifyNodeAddPartition(node, partitionID)
+					return c.notifyNodeAddPartition(node, partition.ID)
 				}); err != nil {
-					log.Printf("Failed to add follower for partition %d to node %s", partitionID, node.ID)
+					log.Printf("Failed to add follower for partition %d to node %s", partition.ID, node.ID)
 					continue
 				}
 
 				neededFollowers--
 				c.mu.Lock()
-				partition.FollowerIDs = append(partition.FollowerIDs, node.ID)
+				c.partitions[partition.ID].FollowerIDs = append(c.partitions[partition.ID].FollowerIDs, node.ID)
 				c.mu.Unlock()
 
-				c.mu.RLock()
-				log.Printf("Rebalance: Assigned follower for partition %d to node %s", partitionID, node.ID)
+				log.Printf("Rebalance: Assigned follower for partition %d to node %s", partition.ID, node.ID)
 			}
 		}
 
@@ -226,64 +221,57 @@ func (c *Controller) rebalancePartitions() {
 		if currentFollowers > desiredFollowers {
 			// Keep the first N followers
 			for _, followerID := range partition.FollowerIDs[desiredFollowers:] {
-				c.mu.RUnlock()
 				if err := model.RetryJob(func() error {
-					return c.notifyNodeRemovePartition(c.nodes[followerID], partitionID)
+					node, _ := c.getNode(followerID)
+					return c.notifyNodeRemovePartition(node, partition.ID)
 				}); err != nil {
-					log.Printf("Failed to remove follower %s from partition %d", followerID, partitionID)
+					log.Printf("Failed to remove follower %s from partition %d", followerID, partition.ID)
 				}
-				c.mu.RLock()
 			}
 
-			c.mu.RUnlock()
 			c.mu.Lock()
-			partition.FollowerIDs = partition.FollowerIDs[:desiredFollowers]
+			c.partitions[partition.ID].FollowerIDs = c.partitions[partition.ID].FollowerIDs[:desiredFollowers]
 			c.mu.Unlock()
-			c.mu.RLock()
 		}
 
 		// If no leader, assign one
 		if partition.LeaderID == "" {
 			if len(partition.FollowerIDs) == 0 {
-				log.Printf("Warning: No followers available for partition %d", partitionID)
+				log.Printf("Warning: No followers available for partition %d", partition.ID)
 				continue
 			}
 			newLeaderID := partition.FollowerIDs[rand.Intn(len(healthyNodes))]
-			c.mu.RUnlock()
 
 			// Update partition leader
-			c.mu.Lock()
 			var updatedFollowers []string
-			partition.LeaderID = newLeaderID
 			for _, id := range partition.FollowerIDs {
 				if id != newLeaderID {
 					updatedFollowers = append(updatedFollowers, id)
 				}
 			}
-			partition.FollowerIDs = updatedFollowers
+
+			c.mu.Lock()
+			c.partitions[partition.ID].LeaderID = newLeaderID
+			c.partitions[partition.ID].FollowerIDs = updatedFollowers
 			c.mu.Unlock()
 
 			// Notify the new leader node
-			if err := c.notifyNodeBecomingLeader(newLeaderID, partitionID); err != nil {
+			if err := c.notifyNodeBecomingLeader(newLeaderID, partition.ID); err != nil {
 				panic(err)
 			}
 
-			c.mu.RLock()
-			log.Printf("Rebalance: Assigned leader for partition %d to node %s", partitionID, newLeaderID)
+			log.Printf("Rebalance: Assigned leader for partition %d to node %s", partition.ID, newLeaderID)
 		}
 	}
 }
 
 // notifyNodeBecomingLeader sends a role change notification to a node
 func (c *Controller) notifyNodeBecomingLeader(nodeID string, partitionID int) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if _, exists := c.partitions[partitionID]; !exists {
+	if _, exists := c.getPartition(partitionID); !exists {
 		log.Printf("Error: Partition %d not found for add partition notification", partitionID)
 		return fmt.Errorf("partition not found")
 	}
-	node, exists := c.nodes[nodeID]
+	node, exists := c.getNode(nodeID)
 	if !exists {
 		log.Printf("Error: Node %s not found for role change notification", nodeID)
 		return fmt.Errorf("node not found")
@@ -303,11 +291,8 @@ func (c *Controller) notifyNodeBecomingLeader(nodeID string, partitionID int) er
 }
 
 // notifyNodeAddPartition sends a add partition notification to a node
-func (c *Controller) notifyNodeAddPartition(node *model.Node, partitionID int) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if _, exists := c.partitions[partitionID]; !exists {
+func (c *Controller) notifyNodeAddPartition(node model.Node, partitionID int) error {
+	if _, exists := c.getPartition(partitionID); !exists {
 		log.Printf("Error: Partition %d not found for add partition notification", partitionID)
 		return fmt.Errorf("partition not found")
 	}
@@ -326,11 +311,8 @@ func (c *Controller) notifyNodeAddPartition(node *model.Node, partitionID int) e
 }
 
 // notifyNodeRemovePartition sends a add partition notification to a node
-func (c *Controller) notifyNodeRemovePartition(node *model.Node, partitionID int) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if _, exists := c.partitions[partitionID]; !exists {
+func (c *Controller) notifyNodeRemovePartition(node model.Node, partitionID int) error {
+	if _, exists := c.getPartition(partitionID); !exists {
 		log.Printf("Error: Partition %d not found for remove partition notification", partitionID)
 		return fmt.Errorf("partition not found")
 	}
@@ -408,17 +390,8 @@ func (c *Controller) handleNodeList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	// Convert to a slice for JSON response
-	nodesList := make([]model.Node, 0, len(c.nodes))
-	for _, node := range c.nodes {
-		nodesList = append(nodesList, *node)
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(nodesList)
+	json.NewEncoder(w).Encode(c.getNodes())
 }
 
 func (c *Controller) handlePartitionList(w http.ResponseWriter, r *http.Request) {
@@ -427,17 +400,8 @@ func (c *Controller) handlePartitionList(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	// Convert to a slice for JSON response
-	partitionsList := make([]model.Partition, 0, len(c.partitions))
-	for _, partition := range c.partitions {
-		partitionsList = append(partitionsList, *partition)
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(partitionsList)
+	json.NewEncoder(w).Encode(c.getPartitions())
 }
 
 func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -463,32 +427,26 @@ func (c *Controller) handleSet(w http.ResponseWriter, r *http.Request) {
 
 	partitionID := hash.GetPartitionID(data.Key, c.partitionCount)
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	partition, exists := c.partitions[partitionID]
+	partition, exists := c.getPartition(partitionID)
 	if !exists {
 		http.Error(w, "Partition not found", http.StatusInternalServerError)
 		return
 	}
 
-	leaderID := partition.LeaderID
-	leaderNode, exists := c.nodes[leaderID]
+	leaderNode, exists := c.getNode(partition.LeaderID)
 	if !exists {
 		http.Error(w, "Leader node not found", http.StatusInternalServerError)
 		return
 	}
 
-	var response map[string]interface{}
 	url := fmt.Sprintf("http://%s/set", leaderNode.Address)
 
-	if err := c.networkClient.Post(url, data, &response); err != nil {
+	if err := c.networkClient.Post(url, data, nil); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	w.WriteHeader(http.StatusOK)
 }
 
 func (c *Controller) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -505,18 +463,14 @@ func (c *Controller) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	partitionID := hash.GetPartitionID(key, c.partitionCount)
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	partition, ok := c.partitions[partitionID]
-	if !ok {
+	partition, exists := c.getPartition(partitionID)
+	if !exists {
 		http.Error(w, "Partition not found", http.StatusInternalServerError)
 		return
 	}
 
-	leaderID := partition.LeaderID
-	leaderNode, ok := c.nodes[leaderID]
-	if !ok {
+	leaderNode, exists := c.getNode(partition.LeaderID)
+	if !exists {
 		http.Error(w, "Leader node not found", http.StatusInternalServerError)
 		return
 	}
@@ -525,7 +479,11 @@ func (c *Controller) handleGet(w http.ResponseWriter, r *http.Request) {
 	url := fmt.Sprintf("http://%s/get?key=%s", leaderNode.Address, key)
 
 	if err := c.networkClient.Get(url, &response); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
+		if err.Error() == "received non-200 response: 404" {
+			http.Error(w, "Key not found", http.StatusNotFound)
+		} else {
+			http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
+		}
 		return
 	}
 
@@ -550,30 +508,60 @@ func (c *Controller) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	partitionID := hash.GetPartitionID(data.Key, c.partitionCount)
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	partition, ok := c.partitions[partitionID]
-	if !ok {
+	partition, exists := c.getPartition(partitionID)
+	if !exists {
 		http.Error(w, "Partition not found", http.StatusInternalServerError)
 		return
 	}
 
-	leaderID := partition.LeaderID
-	leaderNode, ok := c.nodes[leaderID]
-	if !ok {
+	leaderNode, exists := c.getNode(partition.LeaderID)
+	if !exists {
 		http.Error(w, "Leader node not found", http.StatusInternalServerError)
 		return
 	}
 
-	var response map[string]interface{}
 	url := fmt.Sprintf("http://%s/delete", leaderNode.Address)
 
-	if err := c.networkClient.Delete(url, data, &response); err != nil {
+	if err := c.networkClient.Delete(url, data, nil); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (c *Controller) getNodes() (nodes []model.Node) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, node := range c.nodes {
+		nodes = append(nodes, *node)
+	}
+	return
+}
+
+func (c *Controller) getNode(nodeID string) (model.Node, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	node, exists := c.nodes[nodeID]
+	return *node, exists
+}
+
+func (c *Controller) getPartitions() (partitions []model.Partition) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, partition := range c.partitions {
+		partitions = append(partitions, *partition)
+	}
+	return
+}
+
+func (c *Controller) getPartition(partitionID int) (model.Partition, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	partition, exists := c.partitions[partitionID]
+	return *partition, exists
 }

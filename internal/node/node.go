@@ -87,13 +87,9 @@ func (n *Node) startHeartbeat() {
 	for range ticker.C {
 		url := fmt.Sprintf("http://%s/heartbeat", n.ControllerAddr)
 
-		n.mu.RLock()
-		status := string(n.status)
-		n.mu.RUnlock()
-
 		data := map[string]string{
 			"id":     n.ID,
-			"status": status,
+			"status": string(n.getStatus()),
 		}
 
 		if err := n.networkClient.Post(url, data, nil); err != nil {
@@ -103,18 +99,16 @@ func (n *Node) startHeartbeat() {
 }
 
 // AddPartition adds a partition to this node
-func (n *Node) AddPartition(partitionID int) {
+func (n *Node) addPartition(partitionID int) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	p := partition.NewPartition(partitionID, model.NodeRoleFollower)
-	n.partitions[partitionID] = p
-
+	n.partitions[partitionID] = partition.NewPartition(partitionID, model.NodeRoleFollower)
 	log.Printf("Node %s added partition %d", n.ID, partitionID)
 }
 
 // RemovePartition removes a partition from this node
-func (n *Node) RemovePartition(partitionID int) {
+func (n *Node) removePartition(partitionID int) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -122,33 +116,17 @@ func (n *Node) RemovePartition(partitionID int) {
 	log.Printf("Node %s removed partition %d", n.ID, partitionID)
 }
 
-// getPartitionForKey finds the right partition for a given key
-func (n *Node) getPartitionForKey(key string) (*partition.Partition, error) {
-	partitionID := hash.GetPartitionID(key, n.partitionCount)
-
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-
-	p, exists := n.partitions[partitionID]
-	if !exists {
-		return nil, fmt.Errorf("partition %d not found on this node", partitionID)
-	}
-
-	return p, nil
-}
-
 // Set adds or updates a key-value pair
 func (n *Node) Set(key, value string) error {
-	p, err := n.getPartitionForKey(key)
-	if err != nil {
-		return err
+	partitionID := hash.GetPartitionID(key, n.partitionCount)
+	if _, exists := n.getPartition(partitionID); !exists {
+		return fmt.Errorf("partition %d not found on this node", partitionID)
 	}
 
-	if entry := p.Set(key, value); entry != nil {
-		n.mu.RLock()
-		partitionID := p.ID
-		n.mu.RUnlock()
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
+	if entry := n.partitions[partitionID].Set(key, value); entry != nil {
 		go n.notifyFollowers(partitionID, entry)
 	}
 	return nil
@@ -156,27 +134,29 @@ func (n *Node) Set(key, value string) error {
 
 // Get retrieves a value by key
 func (n *Node) Get(key string) (string, bool, error) {
-	p, err := n.getPartitionForKey(key)
-	if err != nil {
-		return "", false, err
+	partitionID := hash.GetPartitionID(key, n.partitionCount)
+	if _, exists := n.getPartition(partitionID); !exists {
+		return "", false, fmt.Errorf("partition %d not found on this node", partitionID)
 	}
 
-	value, exists := p.Get(key)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	value, exists := n.partitions[partitionID].Get(key)
 	return value, exists, nil
 }
 
 // Delete removes a key-value pair
 func (n *Node) Delete(key string) error {
-	p, err := n.getPartitionForKey(key)
-	if err != nil {
-		return err
+	partitionID := hash.GetPartitionID(key, n.partitionCount)
+	if _, exists := n.getPartition(partitionID); !exists {
+		return fmt.Errorf("partition %d not found on this node", partitionID)
 	}
 
-	if entry := p.Delete(key); entry != nil {
-		n.mu.RLock()
-		partitionID := p.ID
-		n.mu.RUnlock()
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
+	if entry := n.partitions[partitionID].Delete(key); entry != nil {
 		go n.notifyFollowers(partitionID, entry)
 	}
 	return nil
@@ -269,9 +249,14 @@ func (n *Node) handleApplyLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p, err := n.getPartitionForKey(entry.Operation.Key)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	partitionID := hash.GetPartitionID(entry.Operation.Key, n.partitionCount)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	p, exists := n.partitions[partitionID]
+	if !exists {
+		http.Error(w, fmt.Sprintf("partition %d not found on this node", partitionID), http.StatusInternalServerError)
 		return
 	}
 
@@ -300,16 +285,16 @@ func (n *Node) handlePartitionUpdate(w http.ResponseWriter, r *http.Request) {
 
 	switch data.Action {
 	case "add":
-		n.AddPartition(data.PartitionID)
+		n.addPartition(data.PartitionID)
 	case "remove":
-		n.RemovePartition(data.PartitionID)
+		n.removePartition(data.PartitionID)
 	case "become_leader":
-		n.mu.RLock()
-		p, exists := n.partitions[data.PartitionID]
-		n.mu.RUnlock()
+		n.mu.Lock()
+		defer n.mu.Unlock()
 
+		p, exists := n.partitions[data.PartitionID]
 		if !exists {
-			http.Error(w, "Partition not found", http.StatusNotFound)
+			http.Error(w, fmt.Sprintf("partition %d not found on this node", data.PartitionID), http.StatusNotFound)
 			return
 		}
 		p.ChangeRole(model.NodeRoleLeader)
@@ -338,16 +323,16 @@ func (n *Node) handleSyncPartition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	n.mu.RLock()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	p, exists := n.partitions[req.PartitionID]
 	if !exists || p.Role != model.NodeRoleFollower {
-		n.mu.RUnlock()
 		http.Error(w, "Not a follower of this partition", http.StatusForbidden)
 		return
 	}
-	n.mu.RUnlock()
-	p.SyncItems(req.Items, req.LastSequenceNum)
 
+	p.SyncItems(req.Items, req.LastSequenceNum)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -385,84 +370,70 @@ func (n *Node) updateData() {
 		}
 
 		if _, exists := nodeMap[n.ID]; !exists {
-			n.mu.Lock()
-			n.partitions = make(map[int]*partition.Partition)
-			n.nodes = make(map[string]*model.Node)
-			n.mu.Unlock()
+			n.setPartitions([]partition.Partition{})
+			n.setNodes([]model.Node{})
 
 			log.Printf("Node %s removed from controller. Re-registering...", n.ID)
 			n.registerWithController()
 			continue
 		}
 
-		n.mu.Lock()
-		n.nodes = nodeMap
-		n.mu.Unlock()
+		n.setNodes(nodeList)
 
 		var toRemove []int
 
-		n.mu.RLock()
-		for id := range n.partitions {
-			contains := model.ContainsString(partitionList[id].FollowerIDs, n.ID)
-			if _, exists := partitionMap[id]; !exists || (!contains && partitionList[id].LeaderID != n.ID) {
-				toRemove = append(toRemove, id)
+		for _, partition := range n.getPartitions() {
+			contains := model.ContainsString(partitionList[partition.ID].FollowerIDs, n.ID)
+			if _, exists := partitionMap[partition.ID]; !exists || (!contains && partitionList[partition.ID].LeaderID != n.ID) {
+				toRemove = append(toRemove, partition.ID)
 			}
 		}
-		n.mu.RUnlock()
 
 		for id := range toRemove {
-			n.RemovePartition(id)
+			n.removePartition(id)
 		}
 
 		flag := false
-		n.mu.RLock()
 		for id := range partitionList {
-			if _, exists := n.partitions[id]; !exists {
+			if _, exists := n.getPartition(id); !exists {
 				flag = true
 				break
 			}
 		}
-		n.mu.RUnlock()
 
 		if flag {
-			n.mu.Lock()
-			n.partitions = make(map[int]*partition.Partition)
-			n.nodes = make(map[string]*model.Node)
-			n.status = model.NodeStatusUnhealthy
-			n.mu.Unlock()
+			n.setPartitions([]partition.Partition{})
+			n.setNodes([]model.Node{})
+			n.setStatus(model.NodeStatusUnhealthy)
 
 			log.Printf("Node %s transitioning to unhealthy state due to inconsistent partitions", n.ID)
 			time.Sleep(10 * time.Second)
 
-			n.mu.Lock()
-			n.status = model.NodeStatusHealthy
-			n.mu.Unlock()
+			n.setStatus(model.NodeStatusHealthy)
 
 			log.Printf("Node %s recovered and is now healthy again", n.ID)
 			n.registerWithController()
 		}
 
 		for id, partition := range partitionList {
-			n.mu.RLock()
+			n.mu.Lock()
 			if p, exists := n.partitions[id]; exists {
 				p.UpdateFollowers(partition.FollowerIDs)
 			}
-			n.mu.RUnlock()
+			n.mu.Unlock()
 		}
 	}
 }
 
 func (n *Node) notifyFollowers(partitionID int, entry *model.LogEntry) {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	for _, nodeID := range n.partitions[partitionID].Followers() {
+	partition, _ := n.getPartition(partitionID)
+	for _, nodeID := range partition.Followers() {
 		if nodeID == n.ID {
 			continue
 		}
-		node := n.nodes[nodeID]
-		partitionItems := n.partitions[partitionID].Items()
+		node, _ := n.getNode(nodeID)
+		partitionItems := partition.Items()
 
-		n.mu.RUnlock()
 		go func(nodeID, nodeAddress string) {
 			url := fmt.Sprintf("http://%s/apply-log", nodeAddress)
 
@@ -478,18 +449,74 @@ func (n *Node) notifyFollowers(partitionID int, entry *model.LogEntry) {
 				}
 			}
 		}(node.ID, node.Address)
-		n.mu.RLock()
 	}
 }
 
 func (n *Node) isLeader() bool {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-
-	for _, partition := range n.partitions {
+	for _, partition := range n.getPartitions() {
 		if partition.Role == model.NodeRoleLeader {
 			return true
 		}
 	}
 	return false
+}
+
+func (n *Node) getStatus() model.NodeStatus {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	return n.status
+}
+
+func (n *Node) setStatus(status model.NodeStatus) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.status = status
+}
+
+func (n *Node) setNodes(nodes []model.Node) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.nodes = make(map[string]*model.Node)
+	for _, node := range nodes {
+		n.nodes[node.ID] = &node
+	}
+}
+
+func (n *Node) getNode(nodeID string) (model.Node, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	node, exists := n.nodes[nodeID]
+	return *node, exists
+}
+
+func (n *Node) getPartition(partitionID int) (partition.Partition, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	partition, exists := n.partitions[partitionID]
+	return *partition, exists
+}
+
+func (n *Node) setPartitions(partitions []partition.Partition) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.partitions = make(map[int]*partition.Partition)
+	for _, partition := range partitions {
+		n.partitions[partition.ID] = &partition
+	}
+}
+
+func (n *Node) getPartitions() (partitions []partition.Partition) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for _, partition := range n.partitions {
+		partitions = append(partitions, *partition)
+	}
+	return
 }

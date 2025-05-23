@@ -59,3 +59,32 @@ func (c *Client) Get(url string, response interface{}) error {
 
 	return json.NewDecoder(resp.Body).Decode(response)
 }
+
+// Delete sends a DELETE request
+func (c *Client) Delete(url string, data interface{}, response interface{}) error {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("DELETE", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("received non-200 response: %d", resp.StatusCode)
+	}
+
+	if response != nil {
+		return json.NewDecoder(resp.Body).Decode(response)
+	}
+	return nil
+}

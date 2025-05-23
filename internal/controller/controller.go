@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sharif-go-lab/SliceDB/internal/model"
+	"github.com/sharif-go-lab/SliceDB/pkg/hash"
 	"github.com/sharif-go-lab/SliceDB/pkg/network"
 )
 
@@ -42,6 +43,9 @@ func (c *Controller) Start(addr string) error {
 	go c.checkHeartbeats()
 
 	// Set up HTTP handlers
+	http.HandleFunc("/set", c.handleSet)
+	http.HandleFunc("/get", c.handleGet)
+	http.HandleFunc("/delete", c.handleDelete)
 	http.HandleFunc("/register", c.handleRegister)
 	http.HandleFunc("/heartbeat", c.handleHeartbeat)
 	http.HandleFunc("/node-list", c.handleNodeList)
@@ -155,40 +159,44 @@ func (c *Controller) handleFailover(unhealthyNodeIDs []string) {
 	// Find partitions where an unhealthy node is a leader
 	for partitionID, partition := range c.partitions {
 		// Remove unhealthy nodes from followers if present
-		for _, nodeID := range unhealthyNodeIDs {
-			var updatedFollowers []string
-			for _, id := range partition.FollowerIDs {
-				if id != nodeID {
-					updatedFollowers = append(updatedFollowers, id)
-				}
+		var updatedFollowers []string
+		for _, id := range partition.FollowerIDs {
+			if !containsString(unhealthyNodeIDs, id) {
+				updatedFollowers = append(updatedFollowers, id)
 			}
-			partition.FollowerIDs = updatedFollowers
+		}
+		partition.FollowerIDs = updatedFollowers
 
-			if partition.LeaderID == nodeID {
-				// Choose a new leader from the followers
-				if len(partition.FollowerIDs) > 0 {
-					newLeaderID := partition.FollowerIDs[0]
+		if containsString(unhealthyNodeIDs, partition.LeaderID) {
+			partition.LeaderID = ""
 
-					// Update partition information
-					partition.LeaderID = newLeaderID
+			// Choose a new leader from the followers
+			if len(partition.FollowerIDs) > 0 {
+				newLeaderID := partition.FollowerIDs[0]
 
-					// Remove new leader from followers
-					var updatedFollowers []string
-					for _, id := range partition.FollowerIDs {
-						if id != newLeaderID {
-							updatedFollowers = append(updatedFollowers, id)
-						}
-					}
-					partition.FollowerIDs = updatedFollowers
-
-					// Notify the new leader
-					c.notifyNodeRoleChange(newLeaderID, partitionID, model.NodeRoleLeader)
-
-					log.Printf("Failover: Node %s is the new leader for partition %d", newLeaderID, partitionID)
-				} else {
-					log.Printf("Warning: No followers available for partition %d after leader %s failure", partitionID, nodeID)
-					partition.LeaderID = ""
+				// Notify the new leader
+				err := c.notifyNodeRoleChange(newLeaderID, partitionID, model.NodeRoleLeader)
+				if err != nil {
+					panic(err)
 				}
+
+				// Update partition information
+				partition.LeaderID = newLeaderID
+
+				// Remove new leader from followers
+				var updatedFollowers []string
+				for _, id := range partition.FollowerIDs {
+					if id != newLeaderID {
+						updatedFollowers = append(updatedFollowers, id)
+					}
+				}
+				partition.FollowerIDs = updatedFollowers
+
+				log.Printf("Failover: Node %s is the new leader for partition %d", newLeaderID, partitionID)
+			}
+
+			if partition.LeaderID == "" {
+				log.Printf("Warning: No followers available for partition %d", partitionID)
 			}
 		}
 	}
@@ -225,7 +233,11 @@ func (c *Controller) rebalancePartitions() {
 
 			if oldLeaderID != newLeaderID {
 				// Notify the new leader node
-				c.notifyNodeRoleChange(newLeaderID, partitionID, model.NodeRoleLeader)
+				err := c.notifyNodeRoleChange(newLeaderID, partitionID, model.NodeRoleLeader)
+				if err != nil {
+					panic(err)
+				}
+
 				log.Printf("Rebalance: Assigned leader for partition %d to node %s", partitionID, newLeaderID)
 			}
 		}
@@ -258,7 +270,11 @@ func (c *Controller) rebalancePartitions() {
 					partition.FollowerIDs = append(partition.FollowerIDs, node.ID)
 
 					// Notify the new follower
-					c.notifyNodeRoleChange(node.ID, partitionID, model.NodeRoleFollower)
+					err := c.notifyNodeRoleChange(node.ID, partitionID, model.NodeRoleFollower)
+					if err != nil {
+						panic(err)
+					}
+
 					log.Printf("Rebalance: Assigned follower for partition %d to node %s", partitionID, node.ID)
 				}
 			}
@@ -441,6 +457,142 @@ func (c *Controller) handlePartitionList(w http.ResponseWriter, r *http.Request)
 func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+}
+
+func (c *Controller) handleSet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var data struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	partitionID := hash.GetPartitionID(data.Key, c.partitionCount)
+
+	c.mu.RLock()
+	partition, exists := c.partitions[partitionID]
+	if !exists {
+		c.mu.RUnlock()
+		http.Error(w, "Partition not found", http.StatusInternalServerError)
+		return
+	}
+
+	leaderID := partition.LeaderID
+	leaderNode, exists := c.nodes[leaderID]
+	c.mu.RUnlock()
+	if !exists {
+		http.Error(w, "Leader node not found", http.StatusInternalServerError)
+		return
+	}
+
+	var response map[string]interface{}
+	url := fmt.Sprintf("http://%s/set", leaderNode.Address)
+
+	err := c.networkClient.Post(url, data, &response)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (c *Controller) handleGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, "Key parameter required", http.StatusBadRequest)
+		return
+	}
+
+	partitionID := hash.GetPartitionID(key, c.partitionCount)
+
+	c.mu.RLock()
+	partition, ok := c.partitions[partitionID]
+	if !ok {
+		c.mu.RUnlock()
+		http.Error(w, "Partition not found", http.StatusInternalServerError)
+		return
+	}
+
+	leaderID := partition.LeaderID
+	leaderNode, ok := c.nodes[leaderID]
+	c.mu.RUnlock()
+	if !ok {
+		http.Error(w, "Leader node not found", http.StatusInternalServerError)
+		return
+	}
+
+	var response map[string]interface{}
+	url := fmt.Sprintf("http://%s/get?key=%s", leaderNode.Address, key)
+
+	err := c.networkClient.Get(url, &response)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (c *Controller) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var data struct {
+		Key string `json:"key"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	partitionID := hash.GetPartitionID(data.Key, c.partitionCount)
+
+	c.mu.RLock()
+	partition, ok := c.partitions[partitionID]
+	if !ok {
+		c.mu.RUnlock()
+		http.Error(w, "Partition not found", http.StatusInternalServerError)
+		return
+	}
+
+	leaderID := partition.LeaderID
+	leaderNode, ok := c.nodes[leaderID]
+	c.mu.RUnlock()
+	if !ok {
+		http.Error(w, "Leader node not found", http.StatusInternalServerError)
+		return
+	}
+
+	var response map[string]interface{}
+	url := fmt.Sprintf("http://%s/delete", leaderNode.Address)
+
+	err := c.networkClient.Delete(url, data, &response)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // Helper function to check if a string slice contains a string

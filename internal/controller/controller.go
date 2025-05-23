@@ -88,7 +88,7 @@ func (c *Controller) registerNode(id, address string) {
 
 		// Register partitions in node
 		for partitionID := range c.partitions {
-			err := c.notifyNodeAddPartition(node, partitionID, model.NodeRoleFollower)
+			err := c.notifyNodeAddPartition(node, partitionID)
 			if err != nil {
 				log.Printf("Failed to registered partition %d to node %s", partitionID, id)
 				return
@@ -263,17 +263,11 @@ func (c *Controller) rebalancePartitions() {
 			for i := 0; neededFollowers > 0 && i < len(availableNodes); i++ {
 				node := c.nodes[availableNodes[i]]
 				err := retryJob(500, 15, func() error {
-					return c.notifyNodeAddPartition(node, partitionID, model.NodeRoleFollower)
+					return c.notifyNodeAddPartition(node, partitionID)
 				})
 				if err == nil {
 					neededFollowers--
 					partition.FollowerIDs = append(partition.FollowerIDs, node.ID)
-
-					// Notify the new follower
-					err := c.notifyNodeRoleChange(node.ID, partitionID, model.NodeRoleFollower)
-					if err != nil {
-						panic(err)
-					}
 
 					log.Printf("Rebalance: Assigned follower for partition %d to node %s", partitionID, node.ID)
 				}
@@ -323,7 +317,7 @@ func (c *Controller) notifyNodeRoleChange(nodeID string, partitionID int, role m
 }
 
 // notifyNodeAddPartition sends a add partition notification to a node
-func (c *Controller) notifyNodeAddPartition(node *model.Node, partitionID int, role model.NodeRole) error {
+func (c *Controller) notifyNodeAddPartition(node *model.Node, partitionID int) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -336,7 +330,6 @@ func (c *Controller) notifyNodeAddPartition(node *model.Node, partitionID int, r
 	data := map[string]interface{}{
 		"action":       "add",
 		"partition_id": partitionID,
-		"role":         role,
 	}
 
 	err := c.networkClient.Post(url, data, nil)

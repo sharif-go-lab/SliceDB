@@ -102,14 +102,14 @@ func (n *Node) sendHeartbeat() {
 }
 
 // AddPartition adds a partition to this node
-func (n *Node) AddPartition(partitionID int, role model.NodeRole) {
+func (n *Node) AddPartition(partitionID int) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	p := partition.NewPartition(partitionID, role)
+	p := partition.NewPartition(partitionID, model.NodeRoleFollower)
 	n.partitions[partitionID] = p
 
-	log.Printf("Node %s added partition %d with role %s", n.ID, partitionID, role)
+	log.Printf("Node %s added partition %d", n.ID, partitionID)
 }
 
 // RemovePartition removes a partition from this node
@@ -283,7 +283,7 @@ func (n *Node) handlePartitionUpdate(w http.ResponseWriter, r *http.Request) {
 
 	switch data.Action {
 	case "add":
-		n.AddPartition(data.PartitionID, data.Role)
+		n.AddPartition(data.PartitionID)
 	case "remove":
 		n.RemovePartition(data.PartitionID)
 	case "change_role":

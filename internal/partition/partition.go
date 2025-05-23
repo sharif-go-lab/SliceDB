@@ -1,6 +1,7 @@
 package partition
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/sharif-go-lab/SliceDB/internal/model"
@@ -9,24 +10,26 @@ import (
 
 // Partition represents a data partition with key-value storage
 type Partition struct {
-	ID        int
-	Role      model.NodeRole
-	data      map[string]string
-	keyLocks  map[string]*sync.Mutex
-	mu        sync.RWMutex
-	wal       *wal.WAL
-	followers []string
+	ID         int
+	Role       model.NodeRole
+	data       map[string]string
+	keyLocks   map[string]*sync.Mutex
+	mu         sync.RWMutex
+	wal        *wal.WAL
+	followers  []string
+	lastUpdate int64
 }
 
 // NewPartition creates a new data partition
 func NewPartition(id int, role model.NodeRole) *Partition {
 	return &Partition{
-		ID:        id,
-		Role:      role,
-		data:      make(map[string]string),
-		keyLocks:  make(map[string]*sync.Mutex),
-		wal:       wal.NewWAL(),
-		followers: make([]string, 0),
+		ID:         id,
+		Role:       role,
+		data:       make(map[string]string),
+		keyLocks:   make(map[string]*sync.Mutex),
+		wal:        wal.NewWAL(),
+		followers:  make([]string, 0),
+		lastUpdate: 0,
 	}
 }
 
@@ -42,7 +45,7 @@ func (p *Partition) acquireKeyLock(key string) *sync.Mutex {
 }
 
 // Set adds or updates a key-value pair
-func (p *Partition) Set(key, value string) error {
+func (p *Partition) Set(key, value string) *model.LogEntry {
 	// Lock the specific key for concurrent operations
 	keyLock := p.acquireKeyLock(key)
 	keyLock.Lock()
@@ -58,14 +61,12 @@ func (p *Partition) Set(key, value string) error {
 		p.data[key] = value
 		p.mu.Unlock()
 
-		// Replicate to followers
-		p.replicateToFollowers(entry)
-
-		return nil
+		return &entry
 	} else {
 		p.mu.Lock()
 		p.data[key] = value
 		p.mu.Unlock()
+
 		return nil
 	}
 }
@@ -80,7 +81,7 @@ func (p *Partition) Get(key string) (string, bool) {
 }
 
 // Delete removes a key-value pair
-func (p *Partition) Delete(key string) error {
+func (p *Partition) Delete(key string) *model.LogEntry {
 	// Lock the specific key
 	keyLock := p.acquireKeyLock(key)
 	keyLock.Lock()
@@ -96,21 +97,22 @@ func (p *Partition) Delete(key string) error {
 		delete(p.data, key)
 		p.mu.Unlock()
 
-		// Replicate to followers
-		p.replicateToFollowers(entry)
-
-		return nil
+		return &entry
 	} else {
-		// Follower nodes should only accept changes from leader
 		p.mu.Lock()
 		delete(p.data, key)
 		p.mu.Unlock()
+
 		return nil
 	}
 }
 
 // ApplyLogEntry applies a log entry to the partition
-func (p *Partition) ApplyLogEntry(entry model.LogEntry) {
+func (p *Partition) ApplyLogEntry(entry model.LogEntry) error {
+	if p.wal.SequenceNumber()+1 != entry.SequenceNumber {
+		return fmt.Errorf("partition data is not sync")
+	}
+
 	switch entry.Operation.Type {
 	case "set":
 		p.mu.Lock()
@@ -121,32 +123,14 @@ func (p *Partition) ApplyLogEntry(entry model.LogEntry) {
 		delete(p.data, entry.Operation.Key)
 		p.mu.Unlock()
 	}
+	return nil
 }
 
-// replicateToFollowers sends a log entry to all followers
-func (p *Partition) replicateToFollowers(entry model.LogEntry) {
-}
-
-// AddFollower adds a follower to the partition
-func (p *Partition) AddFollower(nodeID string) {
+func (p *Partition) UpdateFollowers(nodeIDs []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.followers = append(p.followers, nodeID)
-}
-
-// RemoveFollower removes a follower from the partition
-func (p *Partition) RemoveFollower(nodeID string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	var updatedFollowers []string
-	for _, id := range p.followers {
-		if id != nodeID {
-			updatedFollowers = append(updatedFollowers, id)
-		}
-	}
-	p.followers = updatedFollowers
+	p.followers = nodeIDs
 }
 
 // ChangeRole changes the role of the partition (leader/follower)
@@ -158,7 +142,34 @@ func (p *Partition) ChangeRole(newRole model.NodeRole) {
 
 	// If becoming a follower, clear data to receive fresh data from leader
 	if newRole == model.NodeRoleFollower {
+		p.lastUpdate = 0
 		p.data = make(map[string]string)
 		p.wal.ClearAll()
 	}
+}
+
+func (p *Partition) Followers() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.followers
+}
+
+func (p *Partition) Items() map[string]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.data
+}
+
+func (p *Partition) SyncItems(items map[string]string, lastSync int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.data = make(map[string]string, len(items))
+	for k, v := range items {
+		p.data[k] = v
+	}
+	p.lastUpdate = lastSync
+	p.wal.ClearAll()
 }

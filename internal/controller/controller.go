@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -74,39 +75,26 @@ func (c *Controller) initializePartitions() {
 func (c *Controller) registerNode(id, address string) {
 	healthURL := fmt.Sprintf("http://%s/health", address)
 
-	err := retryJob(500, 15, func() error {
+	if err := model.RetryJob(func() error {
 		var healthResp map[string]interface{}
 		return c.networkClient.Post(healthURL, nil, &healthResp)
-	})
-	if err == nil {
-		node := &model.Node{
+	}); err == nil {
+		c.mu.Lock()
+		c.nodes[id] = &model.Node{
 			ID:       id,
 			Address:  address,
 			Status:   model.NodeStatusHealthy,
 			LastSeen: time.Now(),
 		}
-
-		// Register partitions in node
-		for partitionID := range c.partitions {
-			err := c.notifyNodeAddPartition(node, partitionID)
-			if err != nil {
-				log.Printf("Failed to registered partition %d to node %s", partitionID, id)
-				return
-			}
-		}
-
-		c.mu.Lock()
-		c.nodes[id] = node
 		c.mu.Unlock()
 
 		log.Printf("Node %s registered at %s", id, address)
-		c.rebalancePartitions()
 		return
 	}
 }
 
 // updateNodeHeartbeat updates the last seen time for a node
-func (c *Controller) updateNodeHeartbeat(id string) error {
+func (c *Controller) updateNodeHeartbeat(id string, status model.NodeStatus) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -115,7 +103,7 @@ func (c *Controller) updateNodeHeartbeat(id string) error {
 		return fmt.Errorf("node %s not found", id)
 	}
 
-	node.Status = model.NodeStatusHealthy
+	node.Status = status
 	node.LastSeen = time.Now()
 
 	return nil
@@ -124,96 +112,65 @@ func (c *Controller) updateNodeHeartbeat(id string) error {
 // checkHeartbeats periodically checks node heartbeats
 func (c *Controller) checkHeartbeats() {
 	ticker := time.NewTicker(10 * time.Second)
-
 	for range ticker.C {
-		c.mu.Lock()
-
 		unhealthyNodes := make([]string, 0)
 		now := time.Now()
 
 		// Check for unhealthy nodes
+		c.mu.Lock()
 		for id, node := range c.nodes {
-			if now.Sub(node.LastSeen) > 15*time.Second {
-				if node.Status == model.NodeStatusHealthy {
-					log.Printf("Node %s marked as unhealthy", id)
-					node.Status = model.NodeStatusUnhealthy
-					unhealthyNodes = append(unhealthyNodes, id)
-				}
+			if node.Status == model.NodeStatusUnhealthy {
+				unhealthyNodes = append(unhealthyNodes, id)
+			} else if now.Sub(node.LastSeen) > 15*time.Second {
+				log.Printf("Node %s marked as unhealthy", id)
+				node.Status = model.NodeStatusUnhealthy
+				unhealthyNodes = append(unhealthyNodes, id)
 			}
 		}
-
 		c.mu.Unlock()
 
 		// Handle failover for unhealthy nodes
 		if len(unhealthyNodes) > 0 {
 			c.handleFailover(unhealthyNodes)
 		}
+
+		// Rebalance partitions if needed
+		c.rebalancePartitions()
 	}
 }
 
 // handleFailover manages failover when nodes become unhealthy
 func (c *Controller) handleFailover(unhealthyNodeIDs []string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// Find partitions where an unhealthy node is a leader
-	for partitionID, partition := range c.partitions {
+	c.mu.Lock()
+	for _, partition := range c.partitions {
 		// Remove unhealthy nodes from followers if present
 		var updatedFollowers []string
 		for _, id := range partition.FollowerIDs {
-			if !containsString(unhealthyNodeIDs, id) {
+			if !model.ContainsString(unhealthyNodeIDs, id) {
 				updatedFollowers = append(updatedFollowers, id)
 			}
 		}
 		partition.FollowerIDs = updatedFollowers
 
-		if containsString(unhealthyNodeIDs, partition.LeaderID) {
+		if model.ContainsString(unhealthyNodeIDs, partition.LeaderID) {
 			partition.LeaderID = ""
-
-			// Choose a new leader from the followers
-			if len(partition.FollowerIDs) > 0 {
-				newLeaderID := partition.FollowerIDs[0]
-
-				// Notify the new leader
-				err := c.notifyNodeRoleChange(newLeaderID, partitionID, model.NodeRoleLeader)
-				if err != nil {
-					panic(err)
-				}
-
-				// Update partition information
-				partition.LeaderID = newLeaderID
-
-				// Remove new leader from followers
-				var updatedFollowers []string
-				for _, id := range partition.FollowerIDs {
-					if id != newLeaderID {
-						updatedFollowers = append(updatedFollowers, id)
-					}
-				}
-				partition.FollowerIDs = updatedFollowers
-
-				log.Printf("Failover: Node %s is the new leader for partition %d", newLeaderID, partitionID)
-			}
-
-			if partition.LeaderID == "" {
-				log.Printf("Warning: No followers available for partition %d", partitionID)
-			}
 		}
 	}
-
-	// Rebalance partitions if needed
-	c.rebalancePartitions()
+	c.mu.Unlock()
 }
 
 // rebalancePartitions distributes partitions among available nodes
 func (c *Controller) rebalancePartitions() {
 	// Get healthy nodes
+	c.mu.RLock()
 	healthyNodes := make([]string, 0)
 	for id, node := range c.nodes {
 		if node.Status == model.NodeStatusHealthy {
 			healthyNodes = append(healthyNodes, id)
 		}
 	}
+	c.mu.RUnlock()
 
 	if len(healthyNodes) == 0 {
 		log.Printf("No healthy nodes available for rebalancing")
@@ -221,37 +178,21 @@ func (c *Controller) rebalancePartitions() {
 	}
 
 	// Assign partitions to nodes
+	c.mu.RLock()
 	for partitionID, partition := range c.partitions {
-		// If no leader, assign one
-		if partition.LeaderID == "" || c.nodes[partition.LeaderID].Status != model.NodeStatusHealthy {
-			nodeIndex := partitionID % len(healthyNodes)
-			newLeaderID := healthyNodes[nodeIndex]
-
-			// Update partition leader
-			oldLeaderID := partition.LeaderID
-			partition.LeaderID = newLeaderID
-
-			if oldLeaderID != newLeaderID {
-				// Notify the new leader node
-				err := c.notifyNodeRoleChange(newLeaderID, partitionID, model.NodeRoleLeader)
-				if err != nil {
-					panic(err)
-				}
-
-				log.Printf("Rebalance: Assigned leader for partition %d to node %s", partitionID, newLeaderID)
-			}
-		}
-
 		// Ensure we have enough followers
 		currentFollowers := len(partition.FollowerIDs)
-		desiredFollowers := c.replicationFactor - 1 // -1 because leader is not counted
+		desiredFollowers := c.replicationFactor
+		if partition.LeaderID != "" {
+			desiredFollowers -= 1
+		}
 
 		// If we need more followers
 		if currentFollowers < desiredFollowers {
 			// Find healthy nodes not already leaders or followers
 			availableNodes := make([]string, 0)
 			for _, nodeID := range healthyNodes {
-				if nodeID != partition.LeaderID && !containsString(partition.FollowerIDs, nodeID) {
+				if nodeID != partition.LeaderID && !model.ContainsString(partition.FollowerIDs, nodeID) {
 					availableNodes = append(availableNodes, nodeID)
 				}
 			}
@@ -262,15 +203,22 @@ func (c *Controller) rebalancePartitions() {
 			// Add new followers
 			for i := 0; neededFollowers > 0 && i < len(availableNodes); i++ {
 				node := c.nodes[availableNodes[i]]
-				err := retryJob(500, 15, func() error {
-					return c.notifyNodeAddPartition(node, partitionID)
-				})
-				if err == nil {
-					neededFollowers--
-					partition.FollowerIDs = append(partition.FollowerIDs, node.ID)
 
-					log.Printf("Rebalance: Assigned follower for partition %d to node %s", partitionID, node.ID)
+				c.mu.RUnlock()
+				if err := model.RetryJob(func() error {
+					return c.notifyNodeAddPartition(node, partitionID)
+				}); err != nil {
+					log.Printf("Failed to add follower for partition %d to node %s", partitionID, node.ID)
+					continue
 				}
+
+				neededFollowers--
+				c.mu.Lock()
+				partition.FollowerIDs = append(partition.FollowerIDs, node.ID)
+				c.mu.Unlock()
+
+				c.mu.RLock()
+				log.Printf("Rebalance: Assigned follower for partition %d to node %s", partitionID, node.ID)
 			}
 		}
 
@@ -278,42 +226,80 @@ func (c *Controller) rebalancePartitions() {
 		if currentFollowers > desiredFollowers {
 			// Keep the first N followers
 			for _, followerID := range partition.FollowerIDs[desiredFollowers:] {
-				retryJob(500, 15, func() error {
+				c.mu.RUnlock()
+				if err := model.RetryJob(func() error {
 					return c.notifyNodeRemovePartition(c.nodes[followerID], partitionID)
-				})
+				}); err != nil {
+					log.Printf("Failed to remove follower %s from partition %d", followerID, partitionID)
+				}
+				c.mu.RLock()
 			}
+
+			c.mu.RUnlock()
+			c.mu.Lock()
 			partition.FollowerIDs = partition.FollowerIDs[:desiredFollowers]
+			c.mu.Unlock()
+			c.mu.RLock()
+		}
+
+		// If no leader, assign one
+		if partition.LeaderID == "" {
+			if len(partition.FollowerIDs) == 0 {
+				log.Printf("Warning: No followers available for partition %d", partitionID)
+				continue
+			}
+			newLeaderID := partition.FollowerIDs[rand.Intn(len(healthyNodes))]
+			c.mu.RUnlock()
+
+			// Update partition leader
+			c.mu.Lock()
+			var updatedFollowers []string
+			partition.LeaderID = newLeaderID
+			for _, id := range partition.FollowerIDs {
+				if id != newLeaderID {
+					updatedFollowers = append(updatedFollowers, id)
+				}
+			}
+			partition.FollowerIDs = updatedFollowers
+			c.mu.Unlock()
+
+			// Notify the new leader node
+			if err := c.notifyNodeBecomingLeader(newLeaderID, partitionID); err != nil {
+				panic(err)
+			}
+
+			c.mu.RLock()
+			log.Printf("Rebalance: Assigned leader for partition %d to node %s", partitionID, newLeaderID)
 		}
 	}
 }
 
-// notifyNodeRoleChange sends a role change notification to a node
-func (c *Controller) notifyNodeRoleChange(nodeID string, partitionID int, role model.NodeRole) error {
+// notifyNodeBecomingLeader sends a role change notification to a node
+func (c *Controller) notifyNodeBecomingLeader(nodeID string, partitionID int) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	if _, exists := c.partitions[partitionID]; !exists {
 		log.Printf("Error: Partition %d not found for add partition notification", partitionID)
-		return nil
+		return fmt.Errorf("partition not found")
 	}
 	node, exists := c.nodes[nodeID]
 	if !exists {
 		log.Printf("Error: Node %s not found for role change notification", nodeID)
-		return nil
+		return fmt.Errorf("node not found")
 	}
 
 	url := fmt.Sprintf("http://%s/partition-update", node.Address)
 	data := map[string]interface{}{
-		"action":       "change_role",
+		"action":       "become_leader",
 		"partition_id": partitionID,
-		"role":         role,
 	}
 
-	err := c.networkClient.Post(url, data, nil)
-	if err != nil {
+	if err := c.networkClient.Post(url, data, nil); err != nil {
 		log.Printf("Error notifying node %s of role change: %v", nodeID, err)
+		return err
 	}
-	return err
+	return nil
 }
 
 // notifyNodeAddPartition sends a add partition notification to a node
@@ -323,7 +309,7 @@ func (c *Controller) notifyNodeAddPartition(node *model.Node, partitionID int) e
 
 	if _, exists := c.partitions[partitionID]; !exists {
 		log.Printf("Error: Partition %d not found for add partition notification", partitionID)
-		return nil
+		return fmt.Errorf("partition not found")
 	}
 
 	url := fmt.Sprintf("http://%s/partition-update", node.Address)
@@ -332,11 +318,11 @@ func (c *Controller) notifyNodeAddPartition(node *model.Node, partitionID int) e
 		"partition_id": partitionID,
 	}
 
-	err := c.networkClient.Post(url, data, nil)
-	if err != nil {
+	if err := c.networkClient.Post(url, data, nil); err != nil {
 		log.Printf("Error notifying node %s of adding partition %d: %v", node.ID, partitionID, err)
+		return err
 	}
-	return err
+	return nil
 }
 
 // notifyNodeRemovePartition sends a add partition notification to a node
@@ -346,7 +332,7 @@ func (c *Controller) notifyNodeRemovePartition(node *model.Node, partitionID int
 
 	if _, exists := c.partitions[partitionID]; !exists {
 		log.Printf("Error: Partition %d not found for remove partition notification", partitionID)
-		return nil
+		return fmt.Errorf("partition not found")
 	}
 
 	url := fmt.Sprintf("http://%s/partition-update", node.Address)
@@ -355,11 +341,11 @@ func (c *Controller) notifyNodeRemovePartition(node *model.Node, partitionID int
 		"partition_id": partitionID,
 	}
 
-	err := c.networkClient.Post(url, data, nil)
-	if err != nil {
+	if err := c.networkClient.Post(url, data, nil); err != nil {
 		log.Printf("Error notifying node %s of removing partition %d: %v", node.ID, partitionID, err)
+		return err
 	}
-	return err
+	return nil
 }
 
 // HTTP handlers
@@ -401,7 +387,14 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := c.updateNodeHeartbeat(data.ID); err != nil {
+	var status model.NodeStatus
+	if data.Status == "healthy" {
+		status = model.NodeStatusHealthy
+	} else {
+		status = model.NodeStatusUnhealthy
+	}
+
+	if err := c.updateNodeHeartbeat(data.ID, status); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -471,16 +464,16 @@ func (c *Controller) handleSet(w http.ResponseWriter, r *http.Request) {
 	partitionID := hash.GetPartitionID(data.Key, c.partitionCount)
 
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	partition, exists := c.partitions[partitionID]
 	if !exists {
-		c.mu.RUnlock()
 		http.Error(w, "Partition not found", http.StatusInternalServerError)
 		return
 	}
 
 	leaderID := partition.LeaderID
 	leaderNode, exists := c.nodes[leaderID]
-	c.mu.RUnlock()
 	if !exists {
 		http.Error(w, "Leader node not found", http.StatusInternalServerError)
 		return
@@ -489,8 +482,7 @@ func (c *Controller) handleSet(w http.ResponseWriter, r *http.Request) {
 	var response map[string]interface{}
 	url := fmt.Sprintf("http://%s/set", leaderNode.Address)
 
-	err := c.networkClient.Post(url, data, &response)
-	if err != nil {
+	if err := c.networkClient.Post(url, data, &response); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -514,16 +506,16 @@ func (c *Controller) handleGet(w http.ResponseWriter, r *http.Request) {
 	partitionID := hash.GetPartitionID(key, c.partitionCount)
 
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	partition, ok := c.partitions[partitionID]
 	if !ok {
-		c.mu.RUnlock()
 		http.Error(w, "Partition not found", http.StatusInternalServerError)
 		return
 	}
 
 	leaderID := partition.LeaderID
 	leaderNode, ok := c.nodes[leaderID]
-	c.mu.RUnlock()
 	if !ok {
 		http.Error(w, "Leader node not found", http.StatusInternalServerError)
 		return
@@ -532,8 +524,7 @@ func (c *Controller) handleGet(w http.ResponseWriter, r *http.Request) {
 	var response map[string]interface{}
 	url := fmt.Sprintf("http://%s/get?key=%s", leaderNode.Address, key)
 
-	err := c.networkClient.Get(url, &response)
-	if err != nil {
+	if err := c.networkClient.Get(url, &response); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -560,16 +551,16 @@ func (c *Controller) handleDelete(w http.ResponseWriter, r *http.Request) {
 	partitionID := hash.GetPartitionID(data.Key, c.partitionCount)
 
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	partition, ok := c.partitions[partitionID]
 	if !ok {
-		c.mu.RUnlock()
 		http.Error(w, "Partition not found", http.StatusInternalServerError)
 		return
 	}
 
 	leaderID := partition.LeaderID
 	leaderNode, ok := c.nodes[leaderID]
-	c.mu.RUnlock()
 	if !ok {
 		http.Error(w, "Leader node not found", http.StatusInternalServerError)
 		return
@@ -578,41 +569,11 @@ func (c *Controller) handleDelete(w http.ResponseWriter, r *http.Request) {
 	var response map[string]interface{}
 	url := fmt.Sprintf("http://%s/delete", leaderNode.Address)
 
-	err := c.networkClient.Delete(url, data, &response)
-	if err != nil {
+	if err := c.networkClient.Delete(url, data, &response); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to forward request to leader: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
-}
-
-// Helper function to check if a string slice contains a string
-func containsString(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
-		}
-	}
-	return false
-}
-
-func retryJob(tickMillisec, timeoutSec int, task func() error) (err error) {
-	tick := time.Tick(time.Duration(tickMillisec) * time.Millisecond)
-	timeout := time.After(time.Duration(timeoutSec) * time.Second)
-
-	for {
-		select {
-		case <-timeout:
-			if err == nil {
-				err = fmt.Errorf("timeout exceeded")
-			}
-			return err
-		case <-tick:
-			if err = task(); err == nil {
-				return nil
-			}
-		}
-	}
 }

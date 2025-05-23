@@ -83,3 +83,10 @@ func (w *WAL) ClearAll() {
 	w.logs = make([]model.LogEntry, 0)
 	w.currentSeq = 0
 }
+
+func (w *WAL) SequenceNumber() int64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	return w.currentSeq
+}

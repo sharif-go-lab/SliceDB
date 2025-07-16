@@ -310,7 +310,7 @@ func (c *Controller) notifyNodeAddPartition(node model.Node, partitionID int) er
 	return nil
 }
 
-// notifyNodeRemovePartition sends a add partition notification to a node
+// notifyNodeRemovePartition sends a remove partition notification to a node
 func (c *Controller) notifyNodeRemovePartition(node model.Node, partitionID int) error {
 	if _, exists := c.getPartition(partitionID); !exists {
 		log.Printf("Error: Partition %d not found for remove partition notification", partitionID)

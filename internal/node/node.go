@@ -389,13 +389,13 @@ func (n *Node) updateData() {
 			}
 		}
 
-		for id := range toRemove {
+		for _, id := range toRemove {
 			n.removePartition(id)
 		}
 
 		flag := false
-		for id := range partitionList {
-			if _, exists := n.getPartition(id); !exists {
+		for _, partition := range partitionList {
+			if _, exists := n.getPartition(partition.ID); !exists {
 				flag = true
 				break
 			}

@@ -1,22 +1,25 @@
 services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.10
+    ports:
+      - "2379:2379"
+    command: [ "etcd", "--advertise-client-urls", "http://0.0.0.0:2379", "--listen-client-urls", "http://0.0.0.0:2379" ]
+    networks:
+      - sliceDB-network
+
   controller:
     build: .
     ports:
       - "8080:8080"
     command: ["./controller", "--etcd", "etcd:2379"]
+    depends_on:
+      etcd:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 5s
       timeout: 2s
       retries: 5
-    networks:
-      - sliceDB-network
-
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.10
-    ports:
-      - "2379:2379"
-    command: ["etcd", "--advertise-client-urls", "http://0.0.0.0:2379", "--listen-client-urls", "http://0.0.0.0:2379"]
     networks:
       - sliceDB-network
 
@@ -26,8 +29,8 @@ services:
       - "8081:8081"
     command: ["./node", "--id", "node1", "--addr", ":8081", "--etcd", "etcd:2379"]
     depends_on:
-      etcd:
-        condition: service_started
+      controller:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 5s
@@ -42,8 +45,8 @@ services:
       - "8082:8082"
     command: ["./node", "--id", "node2", "--addr", ":8082", "--etcd", "etcd:2379"]
     depends_on:
-      etcd:
-        condition: service_started
+      controller:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
       interval: 5s
@@ -58,8 +61,8 @@ services:
       - "8083:8083"
     command: ["./node", "--id", "node3", "--addr", ":8083", "--etcd", "etcd:2379"]
     depends_on:
-      etcd:
-        condition: service_started
+      controller:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8083/health"]
       interval: 5s

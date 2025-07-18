@@ -23,10 +23,9 @@ const (
 
 // Node represents a database node in the cluster
 type Node struct {
-	ID       string
-	Address  string
-	Status   NodeStatus
-	LastSeen time.Time
+	ID      string
+	Address string
+	Status  NodeStatus
 }
 
 // Partition represents a data partition

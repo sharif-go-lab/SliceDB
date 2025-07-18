@@ -64,17 +64,14 @@ func (n *Node) Start() error {
 	// Start heartbeat
 	go n.startHeartbeat()
 
-	// Start update data
-	go n.updateData()
-
 	// Start HTTP server for node communication
 	http.HandleFunc("/set", n.handleSet)
 	http.HandleFunc("/get", n.handleGet)
 	http.HandleFunc("/delete", n.handleDelete)
+	http.HandleFunc("/health", n.handleHealth)
 	http.HandleFunc("/apply-log", n.handleApplyLog)
 	http.HandleFunc("/sync-partition", n.handleSyncPartition)
 	http.HandleFunc("/partition-update", n.handlePartitionUpdate)
-	http.HandleFunc("/health", n.handleHealth)
 
 	log.Printf("Node %s starting on %s", n.ID, n.Address)
 	return http.ListenAndServe(n.Address, nil)
@@ -218,7 +215,9 @@ func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]string{"value": value}
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func (n *Node) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -242,6 +241,13 @@ func (n *Node) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (n *Node) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(map[string]string{"status": "healthy"}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func (n *Node) handleApplyLog(w http.ResponseWriter, r *http.Request) {
@@ -313,11 +319,6 @@ func (n *Node) handlePartitionUpdate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
-}
-
 func (n *Node) handleSyncPartition(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PartitionID     int               `json:"partition_id"`
@@ -343,99 +344,14 @@ func (n *Node) handleSyncPartition(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (n *Node) updateData() {
-	ticker := time.NewTicker(5 * time.Second)
-	for range ticker.C {
-		if !n.isLeader() {
-			continue
-		}
-
-		nodeList, err := n.registry.GetNodes(context.Background())
-		if err != nil {
-			log.Printf("Failed to fetch node list: %v", err)
-			continue
-		}
-
-		nodeMap := make(map[string]*model.Node, 0)
-		for _, node := range nodeList {
-			nodeMap[node.ID] = &node
-		}
-
-		partitionList, err := n.registry.GetPartitions(context.Background())
-		if err != nil {
-			log.Printf("Failed to fetch partition list: %v", err)
-			continue
-		}
-
-		partitionMap := make(map[int]*model.Partition, 0)
-		for _, partition := range partitionList {
-			partitionMap[partition.ID] = &partition
-		}
-
-		if _, exists := nodeMap[n.ID]; !exists {
-			n.setPartitions([]partition.Partition{})
-			n.setNodes([]model.Node{})
-
-			log.Printf("Node %s removed from registry. Re-registering...", n.ID)
-			n.registerWithEtcd()
-			continue
-		}
-
-		n.setNodes(nodeList)
-
-		var toRemove []int
-
-		for _, partition := range n.getPartitions() {
-			contains := model.ContainsString(partitionList[partition.ID].FollowerIDs, n.ID)
-			if _, exists := partitionMap[partition.ID]; !exists || (!contains && partitionList[partition.ID].LeaderID != n.ID) {
-				toRemove = append(toRemove, partition.ID)
-			}
-		}
-
-		for _, id := range toRemove {
-			n.removePartition(id)
-		}
-
-		flag := false
-		for _, partition := range partitionList {
-			if _, exists := n.getPartition(partition.ID); !exists {
-				flag = true
-				break
-			}
-		}
-
-		if flag {
-			n.setPartitions([]partition.Partition{})
-			n.setNodes([]model.Node{})
-			n.setStatus(model.NodeStatusUnhealthy)
-
-			log.Printf("Node %s transitioning to unhealthy state due to inconsistent partitions", n.ID)
-			time.Sleep(10 * time.Second)
-
-			n.setStatus(model.NodeStatusHealthy)
-
-			log.Printf("Node %s recovered and is now healthy again", n.ID)
-			n.registerWithEtcd()
-		}
-
-		for id, partition := range partitionList {
-			n.mu.Lock()
-			if p, exists := n.partitions[id]; exists {
-				p.UpdateFollowers(partition.FollowerIDs)
-			}
-			n.mu.Unlock()
-		}
-	}
-}
-
 func (n *Node) notifyFollowers(partitionID int, entry *model.LogEntry) {
-	partition, _ := n.getPartition(partitionID)
-	for _, nodeID := range partition.Followers() {
+	p, _ := n.getPartition(partitionID)
+	for _, nodeID := range p.Followers() {
 		if nodeID == n.ID {
 			continue
 		}
 		node, _ := n.getNode(nodeID)
-		partitionItems := partition.Items()
+		partitionItems := p.Items()
 
 		go func(nodeID, nodeAddress string) {
 			url := fmt.Sprintf("http://%s/apply-log", nodeAddress)
@@ -456,8 +372,8 @@ func (n *Node) notifyFollowers(partitionID int, entry *model.LogEntry) {
 }
 
 func (n *Node) isLeader() bool {
-	for _, partition := range n.getPartitions() {
-		if partition.Role == model.NodeRoleLeader {
+	for _, p := range n.getPartitions() {
+		if p.Role == model.NodeRoleLeader {
 			return true
 		}
 	}
@@ -493,6 +409,9 @@ func (n *Node) getNode(nodeID string) (model.Node, bool) {
 	defer n.mu.RUnlock()
 
 	node, exists := n.nodes[nodeID]
+	if !exists {
+		return model.Node{}, false
+	}
 	return *node, exists
 }
 
@@ -500,8 +419,11 @@ func (n *Node) getPartition(partitionID int) (partition.Partition, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
-	partition, exists := n.partitions[partitionID]
-	return *partition, exists
+	p, exists := n.partitions[partitionID]
+	if !exists {
+		return partition.Partition{}, false
+	}
+	return *p, exists
 }
 
 func (n *Node) setPartitions(partitions []partition.Partition) {
@@ -509,8 +431,8 @@ func (n *Node) setPartitions(partitions []partition.Partition) {
 	defer n.mu.Unlock()
 
 	n.partitions = make(map[int]*partition.Partition)
-	for _, partition := range partitions {
-		n.partitions[partition.ID] = &partition
+	for _, p := range partitions {
+		n.partitions[p.ID] = &p
 	}
 }
 
@@ -518,8 +440,8 @@ func (n *Node) getPartitions() (partitions []partition.Partition) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	for _, partition := range n.partitions {
-		partitions = append(partitions, *partition)
+	for _, p := range n.partitions {
+		partitions = append(partitions, *p)
 	}
 	return
 }

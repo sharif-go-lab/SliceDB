@@ -1,2 +1,0 @@
-# SliceDB
-Distributed in-memory key-value DB in Go with partitioning, replication, load balancing, fail-over, and snapshot sync. Dockerized for scalable cluster testing and designed for research in distributed systems.

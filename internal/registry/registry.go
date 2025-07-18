@@ -29,10 +29,14 @@ func NewRegistry(endpoints []string) (*Registry, error) {
 }
 
 // Close closes the underlying etcd client.
-func (r *Registry) Close() error { return r.client.Close() }
+func (r *Registry) Close() error {
+	return r.client.Close()
+}
 
 // Client exposes the underlying etcd client.
-func (r *Registry) Client() *clientv3.Client { return r.client }
+func (r *Registry) Client() *clientv3.Client {
+	return r.client
+}
 
 // RegisterNode registers a node with a TTL lease and keeps it alive.
 func (r *Registry) RegisterNode(ctx context.Context, node model.Node, ttl int64) (clientv3.LeaseID, error) {

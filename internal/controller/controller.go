@@ -58,6 +58,8 @@ func (c *Controller) Start(addr string) error {
 
 	// Load existing partitions
 	c.initializePartitions()
+	// Load existing nodes from registry
+	c.initializeNodes()
 
 	// Start leader election which runs heartbeats when leader
 	go c.leaderElection()
@@ -96,6 +98,26 @@ func (c *Controller) initializePartitions() {
 		if c.registry != nil {
 			c.registry.PutPartition(context.Background(), p)
 		}
+	}
+}
+
+// initializeNodes loads any nodes already registered in etcd into the controller state.
+func (c *Controller) initializeNodes() {
+	if c.registry == nil {
+		return
+	}
+
+	nodes, err := c.registry.GetNodes(context.Background())
+	if err != nil {
+		log.Printf("failed to load nodes: %v", err)
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, n := range nodes {
+		node := n
+		c.nodes[n.ID] = &node
 	}
 }
 

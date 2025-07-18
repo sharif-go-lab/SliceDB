@@ -11,13 +11,10 @@ import (
 	"github.com/sharif-go-lab/SliceDB/internal/model"
 )
 
-// EtcdRegistry wraps an etcd client and provides helper methods for
-// membership and service discovery.
 type EtcdRegistry struct {
 	client *clientv3.Client
 }
 
-// NewEtcdRegistry creates a new registry backed by etcd.
 func NewEtcdRegistry(endpoints []string) (*EtcdRegistry, error) {
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   endpoints,
@@ -29,7 +26,6 @@ func NewEtcdRegistry(endpoints []string) (*EtcdRegistry, error) {
 	return &EtcdRegistry{client: cli}, nil
 }
 
-// RegisterNode registers a node under /nodes/<id> using a lease for TTL.
 func (r *EtcdRegistry) RegisterNode(ctx context.Context, node model.Node, ttl int64) (clientv3.LeaseID, error) {
 	lease, err := r.client.Grant(ctx, ttl)
 	if err != nil {
@@ -54,13 +50,11 @@ func (r *EtcdRegistry) RegisterNode(ctx context.Context, node model.Node, ttl in
 	return lease.ID, err
 }
 
-// UpdateNodeHeartbeat renews the lease for a node.
 func (r *EtcdRegistry) UpdateNodeHeartbeat(ctx context.Context, leaseID clientv3.LeaseID) error {
 	_, err := r.client.KeepAliveOnce(ctx, leaseID)
 	return err
 }
 
-// GetNodes returns all registered nodes.
 func (r *EtcdRegistry) GetNodes(ctx context.Context) ([]model.Node, error) {
 	resp, err := r.client.Get(ctx, "/nodes/", clientv3.WithPrefix())
 	if err != nil {
@@ -76,7 +70,6 @@ func (r *EtcdRegistry) GetNodes(ctx context.Context) ([]model.Node, error) {
 	return nodes, nil
 }
 
-// SetPartition stores partition info under /partitions/<id>.
 func (r *EtcdRegistry) SetPartition(ctx context.Context, p model.Partition) error {
 	data, err := json.Marshal(p)
 	if err != nil {
@@ -87,18 +80,33 @@ func (r *EtcdRegistry) SetPartition(ctx context.Context, p model.Partition) erro
 	return err
 }
 
-// GetPartitions fetches all partitions from etcd.
 func (r *EtcdRegistry) GetPartitions(ctx context.Context) ([]model.Partition, error) {
 	resp, err := r.client.Get(ctx, "/partitions/", clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
-	var parts []model.Partition
+	var partitions []model.Partition
 	for _, kv := range resp.Kvs {
 		var p model.Partition
 		if err := json.Unmarshal(kv.Value, &p); err == nil {
-			parts = append(parts, p)
+			partitions = append(partitions, p)
 		}
 	}
-	return parts, nil
+	return partitions, nil
+}
+
+func (r *EtcdRegistry) SetControllerAddress(ctx context.Context, address string) error {
+	_, err := r.client.Put(ctx, "/controller/address", address)
+	return err
+}
+
+func (r *EtcdRegistry) GetControllerAddress(ctx context.Context) (string, error) {
+	resp, err := r.client.Get(ctx, "/controller/address", clientv3.WithPrefix())
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Kvs) == 0 {
+		return "", fmt.Errorf("controller address not found")
+	}
+	return string(resp.Kvs[0].Value), nil
 }

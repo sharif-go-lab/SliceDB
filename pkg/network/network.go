@@ -8,12 +8,10 @@ import (
 	"time"
 )
 
-// Client is a simple HTTP client for node-to-node communication
 type Client struct {
 	httpClient *http.Client
 }
 
-// NewClient creates a new network client
 func NewClient() *Client {
 	return &Client{
 		httpClient: &http.Client{
@@ -22,7 +20,6 @@ func NewClient() *Client {
 	}
 }
 
-// Post sends a POST request with JSON data
 func (c *Client) Post(url string, data interface{}, response interface{}) error {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -45,7 +42,6 @@ func (c *Client) Post(url string, data interface{}, response interface{}) error 
 	return nil
 }
 
-// Get sends a GET request
 func (c *Client) Get(url string, response interface{}) error {
 	resp, err := c.httpClient.Get(url)
 	if err != nil {
@@ -60,7 +56,6 @@ func (c *Client) Get(url string, response interface{}) error {
 	return json.NewDecoder(resp.Body).Decode(response)
 }
 
-// Delete sends a DELETE request
 func (c *Client) Delete(url string, data interface{}, response interface{}) error {
 	jsonData, err := json.Marshal(data)
 	if err != nil {

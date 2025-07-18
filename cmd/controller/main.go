@@ -18,7 +18,7 @@ func main() {
 
 	// Create and start controller
 	endpoints := strings.Split(*etcdEndpoints, ",")
-	ctrl := controller.NewController(*partitionCount, *replicationFactor, endpoints)
+	ctrl := controller.NewController(*partitionCount, *replicationFactor, endpoints, *addr)
 	log.Printf("Starting controller with %d partitions and replication factor %d", *partitionCount, *replicationFactor)
 
 	if err := ctrl.Start(*addr); err != nil {

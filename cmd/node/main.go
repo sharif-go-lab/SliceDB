@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"strings"
 
 	"github.com/sharif-go-lab/SliceDB/internal/node"
 )
@@ -12,7 +13,7 @@ func main() {
 	id := flag.String("id", "", "Node ID")
 	addr := flag.String("addr", ":8081", "Node address")
 	partitionCount := flag.Int("partitions", 10, "Number of partitions")
-	controllerAddr := flag.String("controller", "localhost:8080", "Controller address")
+	etcdEndpoints := flag.String("etcd", "localhost:2379", "comma separated etcd endpoints")
 	flag.Parse()
 
 	if *id == "" {
@@ -20,8 +21,9 @@ func main() {
 	}
 
 	// Create and start node
-	n := node.NewNode(*id, *addr, *controllerAddr, *partitionCount)
-	log.Printf("Starting node %s at %s, controller at %s with %d partitions", *id, *addr, *controllerAddr, *partitionCount)
+	endpoints := strings.Split(*etcdEndpoints, ",")
+	n := node.NewNode(*id, *addr, endpoints, *partitionCount)
+	log.Printf("Starting node %s at %s with %d partitions", *id, *addr, *partitionCount)
 
 	if err := n.Start(); err != nil {
 		log.Fatalf("Node error: %v", err)

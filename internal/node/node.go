@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,8 +9,11 @@ import (
 	"sync"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/sharif-go-lab/SliceDB/internal/model"
 	"github.com/sharif-go-lab/SliceDB/internal/partition"
+	"github.com/sharif-go-lab/SliceDB/internal/registry"
 	"github.com/sharif-go-lab/SliceDB/pkg/hash"
 	"github.com/sharif-go-lab/SliceDB/pkg/network"
 )
@@ -18,26 +22,33 @@ import (
 type Node struct {
 	ID             string
 	Address        string
-	ControllerAddr string
 	partitions     map[int]*partition.Partition
 	nodes          map[string]*model.Node
 	partitionCount int
 	mu             sync.RWMutex
 	networkClient  *network.Client
 	status         model.NodeStatus
+
+	registry *registry.EtcdRegistry
+	leaseID  clientv3.LeaseID
 }
 
 // NewNode creates a new database node
-func NewNode(id, address, controllerAddr string, partitionCount int) *Node {
+func NewNode(id, address string, etcdEndpoints []string, partitionCount int) *Node {
+	reg, err := registry.NewEtcdRegistry(etcdEndpoints)
+	if err != nil {
+		log.Fatalf("failed to connect to etcd: %v", err)
+	}
+
 	node := &Node{
 		ID:             id,
 		Address:        address,
-		ControllerAddr: controllerAddr,
 		partitions:     make(map[int]*partition.Partition),
 		nodes:          make(map[string]*model.Node),
 		partitionCount: partitionCount,
 		networkClient:  network.NewClient(),
 		status:         model.NodeStatusHealthy,
+		registry:       reg,
 	}
 
 	return node
@@ -45,9 +56,9 @@ func NewNode(id, address, controllerAddr string, partitionCount int) *Node {
 
 // Start begins the node operation
 func (n *Node) Start() error {
-	// Register with controller
-	if err := n.registerWithController(); err != nil {
-		return fmt.Errorf("failed to register with controller: %v", err)
+	// Register with etcd
+	if err := n.registerWithEtcd(); err != nil {
+		return fmt.Errorf("failed to register with etcd: %v", err)
 	}
 
 	// Start heartbeat
@@ -69,30 +80,26 @@ func (n *Node) Start() error {
 	return http.ListenAndServe(n.Address, nil)
 }
 
-// registerWithController registers this node with the controller
-func (n *Node) registerWithController() error {
-	url := fmt.Sprintf("http://%s/register", n.ControllerAddr)
-
-	data := map[string]string{
-		"id":      n.ID,
-		"address": n.Address,
+// registerWithEtcd registers this node in etcd using a lease
+func (n *Node) registerWithEtcd() error {
+	node := model.Node{
+		ID:      n.ID,
+		Address: n.Address,
+		Status:  model.NodeStatusHealthy,
 	}
 
-	return n.networkClient.Post(url, data, nil)
+	lease, err := n.registry.RegisterNode(context.Background(), node, 15)
+	if err == nil {
+		n.leaseID = lease
+	}
+	return err
 }
 
 // startHeartbeat begins sending periodic heartbeats to the controller
 func (n *Node) startHeartbeat() {
 	ticker := time.NewTicker(5 * time.Second)
 	for range ticker.C {
-		url := fmt.Sprintf("http://%s/heartbeat", n.ControllerAddr)
-
-		data := map[string]string{
-			"id":     n.ID,
-			"status": string(n.getStatus()),
-		}
-
-		if err := n.networkClient.Post(url, data, nil); err != nil {
+		if err := n.registry.UpdateNodeHeartbeat(context.Background(), n.leaseID); err != nil {
 			log.Printf("Error sending heartbeat: %v", err)
 		}
 	}
@@ -343,10 +350,8 @@ func (n *Node) updateData() {
 			continue
 		}
 
-		nodeList := make([]model.Node, 0)
-		url := fmt.Sprintf("http://%s/node-list", n.ControllerAddr)
-
-		if err := n.networkClient.Get(url, &nodeList); err != nil {
+		nodeList, err := n.registry.GetNodes(context.Background())
+		if err != nil {
 			log.Printf("Failed to fetch node list: %v", err)
 			continue
 		}
@@ -356,10 +361,8 @@ func (n *Node) updateData() {
 			nodeMap[node.ID] = &node
 		}
 
-		partitionList := make([]model.Partition, 0)
-		url = fmt.Sprintf("http://%s/partition-list", n.ControllerAddr)
-
-		if err := n.networkClient.Get(url, &partitionList); err != nil {
+		partitionList, err := n.registry.GetPartitions(context.Background())
+		if err != nil {
 			log.Printf("Failed to fetch partition list: %v", err)
 			continue
 		}
@@ -373,8 +376,8 @@ func (n *Node) updateData() {
 			n.setPartitions([]partition.Partition{})
 			n.setNodes([]model.Node{})
 
-			log.Printf("Node %s removed from controller. Re-registering...", n.ID)
-			n.registerWithController()
+			log.Printf("Node %s removed from registry. Re-registering...", n.ID)
+			n.registerWithEtcd()
 			continue
 		}
 
@@ -412,7 +415,7 @@ func (n *Node) updateData() {
 			n.setStatus(model.NodeStatusHealthy)
 
 			log.Printf("Node %s recovered and is now healthy again", n.ID)
-			n.registerWithController()
+			n.registerWithEtcd()
 		}
 
 		for id, partition := range partitionList {

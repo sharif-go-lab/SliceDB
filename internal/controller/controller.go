@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sharif-go-lab/SliceDB/internal/model"
+	"github.com/sharif-go-lab/SliceDB/internal/registry"
 	"github.com/sharif-go-lab/SliceDB/pkg/hash"
 	"github.com/sharif-go-lab/SliceDB/pkg/network"
 )
@@ -22,23 +24,32 @@ type Controller struct {
 	replicationFactor int
 	mu                sync.RWMutex
 	networkClient     *network.Client
+	registry          *registry.EtcdRegistry
 }
 
 // NewController creates a new controller
-func NewController(partitionCount, replicationFactor int) *Controller {
+func NewController(partitionCount, replicationFactor int, etcdEndpoints []string) *Controller {
+	reg, err := registry.NewEtcdRegistry(etcdEndpoints)
+	if err != nil {
+		log.Fatalf("failed to connect to etcd: %v", err)
+	}
+
 	return &Controller{
 		nodes:             make(map[string]*model.Node),
 		partitions:        make(map[int]*model.Partition),
 		partitionCount:    partitionCount,
 		replicationFactor: replicationFactor,
 		networkClient:     network.NewClient(),
+		registry:          reg,
 	}
 }
 
 // Start begins the controller operation
 func (c *Controller) Start(addr string) error {
-	// Initialize partitions
-	c.initializePartitions()
+	// Initialize partitions from etcd if possible
+	if err := c.initializePartitions(); err != nil {
+		return err
+	}
 
 	// Start heartbeat checker
 	go c.checkHeartbeats()
@@ -58,17 +69,26 @@ func (c *Controller) Start(addr string) error {
 }
 
 // initializePartitions creates the initial partition map without assigning nodes
-func (c *Controller) initializePartitions() {
+func (c *Controller) initializePartitions() error {
+	parts, err := c.registry.GetPartitions(context.Background())
+	if err == nil && len(parts) == c.partitionCount {
+		c.mu.Lock()
+		for _, p := range parts {
+			cp := p
+			c.partitions[p.ID] = &cp
+		}
+		c.mu.Unlock()
+		return nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	for i := 0; i < c.partitionCount; i++ {
-		c.partitions[i] = &model.Partition{
-			ID:          i,
-			LeaderID:    "",
-			FollowerIDs: make([]string, 0),
-		}
+		p := &model.Partition{ID: i, LeaderID: "", FollowerIDs: make([]string, 0)}
+		c.partitions[i] = p
+		_ = c.registry.SetPartition(context.Background(), *p)
 	}
+	return nil
 }
 
 // registerNode adds a new node to the cluster
@@ -79,14 +99,16 @@ func (c *Controller) registerNode(id, address string) {
 		var healthResp map[string]interface{}
 		return c.networkClient.Post(healthURL, nil, &healthResp)
 	}); err == nil {
-		c.mu.Lock()
-		c.nodes[id] = &model.Node{
+		node := model.Node{
 			ID:       id,
 			Address:  address,
 			Status:   model.NodeStatusHealthy,
 			LastSeen: time.Now(),
 		}
+		c.mu.Lock()
+		c.nodes[id] = &node
 		c.mu.Unlock()
+		_, _ = c.registry.RegisterNode(context.Background(), node, 15)
 
 		log.Printf("Node %s registered at %s", id, address)
 		return
@@ -113,28 +135,18 @@ func (c *Controller) updateNodeHeartbeat(id string, status model.NodeStatus) err
 func (c *Controller) checkHeartbeats() {
 	ticker := time.NewTicker(10 * time.Second)
 	for range ticker.C {
-		unhealthyNodes := make([]string, 0)
-		now := time.Now()
-
-		// Check for unhealthy nodes
+		nodes, err := c.registry.GetNodes(context.Background())
+		if err != nil {
+			log.Printf("failed to query nodes from etcd: %v", err)
+			continue
+		}
 		c.mu.Lock()
-		for id, node := range c.nodes {
-			if node.Status == model.NodeStatusUnhealthy {
-				unhealthyNodes = append(unhealthyNodes, id)
-			} else if now.Sub(node.LastSeen) > 15*time.Second {
-				log.Printf("Node %s marked as unhealthy", id)
-				node.Status = model.NodeStatusUnhealthy
-				unhealthyNodes = append(unhealthyNodes, id)
-			}
+		c.nodes = make(map[string]*model.Node)
+		for _, n := range nodes {
+			nCopy := n
+			c.nodes[n.ID] = &nCopy
 		}
 		c.mu.Unlock()
-
-		// Handle failover for unhealthy nodes
-		if len(unhealthyNodes) > 0 {
-			c.handleFailover(unhealthyNodes)
-		}
-
-		// Rebalance partitions if needed
 		c.rebalancePartitions()
 	}
 }
@@ -211,6 +223,7 @@ func (c *Controller) rebalancePartitions() {
 				neededFollowers--
 				c.mu.Lock()
 				c.partitions[partition.ID].FollowerIDs = append(c.partitions[partition.ID].FollowerIDs, node.ID)
+				_ = c.registry.SetPartition(context.Background(), *c.partitions[partition.ID])
 				c.mu.Unlock()
 
 				log.Printf("Rebalance: Assigned follower for partition %d to node %s", partition.ID, node.ID)
@@ -231,6 +244,7 @@ func (c *Controller) rebalancePartitions() {
 
 			c.mu.Lock()
 			c.partitions[partition.ID].FollowerIDs = c.partitions[partition.ID].FollowerIDs[:desiredFollowers]
+			_ = c.registry.SetPartition(context.Background(), *c.partitions[partition.ID])
 			c.mu.Unlock()
 		}
 
@@ -253,6 +267,7 @@ func (c *Controller) rebalancePartitions() {
 			c.mu.Lock()
 			c.partitions[partition.ID].LeaderID = newLeaderID
 			c.partitions[partition.ID].FollowerIDs = updatedFollowers
+			_ = c.registry.SetPartition(context.Background(), *c.partitions[partition.ID])
 			c.mu.Unlock()
 
 			// Notify the new leader node
@@ -531,37 +546,45 @@ func (c *Controller) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Controller) getNodes() (nodes []model.Node) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	for _, node := range c.nodes {
-		nodes = append(nodes, *node)
+	list, err := c.registry.GetNodes(context.Background())
+	if err != nil {
+		log.Printf("failed to query nodes: %v", err)
+		return nil
 	}
-	return
+	return list
 }
 
 func (c *Controller) getNode(nodeID string) (model.Node, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	node, exists := c.nodes[nodeID]
-	return *node, exists
+	nodes, err := c.registry.GetNodes(context.Background())
+	if err != nil {
+		return model.Node{}, false
+	}
+	for _, n := range nodes {
+		if n.ID == nodeID {
+			return n, true
+		}
+	}
+	return model.Node{}, false
 }
 
 func (c *Controller) getPartitions() (partitions []model.Partition) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	for _, partition := range c.partitions {
-		partitions = append(partitions, *partition)
+	parts, err := c.registry.GetPartitions(context.Background())
+	if err != nil {
+		log.Printf("failed to query partitions: %v", err)
+		return nil
 	}
-	return
+	return parts
 }
 
 func (c *Controller) getPartition(partitionID int) (model.Partition, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	partition, exists := c.partitions[partitionID]
-	return *partition, exists
+	parts, err := c.registry.GetPartitions(context.Background())
+	if err != nil {
+		return model.Partition{}, false
+	}
+	for _, p := range parts {
+		if p.ID == partitionID {
+			return p, true
+		}
+	}
+	return model.Partition{}, false
 }

@@ -1,47 +1,66 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/sharif-go-lab/SliceDB/internal/model"
+	"github.com/sharif-go-lab/SliceDB/internal/registry"
 	"github.com/sharif-go-lab/SliceDB/pkg/hash"
 	"github.com/sharif-go-lab/SliceDB/pkg/network"
+
+	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
 // Controller manages the cluster nodes and partitions
 type Controller struct {
+	id                string
+	isLeader          bool
+	leaderCancel      context.CancelFunc
 	nodes             map[string]*model.Node
 	partitions        map[int]*model.Partition
 	partitionCount    int
 	replicationFactor int
 	mu                sync.RWMutex
 	networkClient     *network.Client
+	registry          *registry.Registry
+	etcdEndpoints     []string
 }
 
 // NewController creates a new controller
-func NewController(partitionCount, replicationFactor int) *Controller {
+func NewController(id string, partitionCount, replicationFactor int, etcdEndpoints string) *Controller {
 	return &Controller{
+		id:                id,
 		nodes:             make(map[string]*model.Node),
 		partitions:        make(map[int]*model.Partition),
 		partitionCount:    partitionCount,
 		replicationFactor: replicationFactor,
 		networkClient:     network.NewClient(),
+		etcdEndpoints:     strings.Split(etcdEndpoints, ","),
 	}
 }
 
 // Start begins the controller operation
 func (c *Controller) Start(addr string) error {
-	// Initialize partitions
+	// Connect to etcd
+	reg, err := registry.NewRegistry(c.etcdEndpoints)
+	if err != nil {
+		return err
+	}
+	c.registry = reg
+
+	// Load existing partitions
 	c.initializePartitions()
 
-	// Start heartbeat checker
-	go c.checkHeartbeats()
+	// Start leader election which runs heartbeats when leader
+	go c.leaderElection()
 
 	// Set up HTTP handlers
 	http.HandleFunc("/set", c.handleSet)
@@ -62,11 +81,20 @@ func (c *Controller) initializePartitions() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	parts, err := c.registry.GetPartitions(context.Background())
+	if err == nil && len(parts) > 0 {
+		for _, p := range parts {
+			cp := p
+			c.partitions[p.ID] = &cp
+		}
+		return
+	}
+
 	for i := 0; i < c.partitionCount; i++ {
-		c.partitions[i] = &model.Partition{
-			ID:          i,
-			LeaderID:    "",
-			FollowerIDs: make([]string, 0),
+		p := model.Partition{ID: i, LeaderID: "", FollowerIDs: make([]string, 0)}
+		c.partitions[i] = &p
+		if c.registry != nil {
+			c.registry.PutPartition(context.Background(), p)
 		}
 	}
 }
@@ -80,11 +108,15 @@ func (c *Controller) registerNode(id, address string) {
 		return c.networkClient.Post(healthURL, nil, &healthResp)
 	}); err == nil {
 		c.mu.Lock()
-		c.nodes[id] = &model.Node{
+		node := model.Node{
 			ID:       id,
 			Address:  address,
 			Status:   model.NodeStatusHealthy,
 			LastSeen: time.Now(),
+		}
+		c.nodes[id] = &node
+		if c.registry != nil {
+			c.registry.RegisterNode(context.Background(), node, 10)
 		}
 		c.mu.Unlock()
 
@@ -110,32 +142,48 @@ func (c *Controller) updateNodeHeartbeat(id string, status model.NodeStatus) err
 }
 
 // checkHeartbeats periodically checks node heartbeats
-func (c *Controller) checkHeartbeats() {
+func (c *Controller) checkHeartbeats(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
-	for range ticker.C {
-		unhealthyNodes := make([]string, 0)
-		now := time.Now()
-
-		// Check for unhealthy nodes
-		c.mu.Lock()
-		for id, node := range c.nodes {
-			if node.Status == model.NodeStatusUnhealthy {
-				unhealthyNodes = append(unhealthyNodes, id)
-			} else if now.Sub(node.LastSeen) > 15*time.Second {
-				log.Printf("Node %s marked as unhealthy", id)
-				node.Status = model.NodeStatusUnhealthy
-				unhealthyNodes = append(unhealthyNodes, id)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			nodes, err := c.registry.GetNodes(context.Background())
+			if err != nil {
+				log.Printf("failed to query registry: %v", err)
+				continue
 			}
-		}
-		c.mu.Unlock()
 
-		// Handle failover for unhealthy nodes
-		if len(unhealthyNodes) > 0 {
-			c.handleFailover(unhealthyNodes)
-		}
+			current := make(map[string]model.Node)
+			for _, n := range nodes {
+				current[n.ID] = n
+			}
 
-		// Rebalance partitions if needed
-		c.rebalancePartitions()
+			var removed []string
+
+			c.mu.Lock()
+			for id := range c.nodes {
+				if _, ok := current[id]; !ok {
+					removed = append(removed, id)
+					delete(c.nodes, id)
+				}
+			}
+			for id, n := range current {
+				if _, ok := c.nodes[id]; !ok {
+					node := n
+					c.nodes[id] = &node
+				}
+			}
+			c.mu.Unlock()
+
+			if len(removed) > 0 {
+				c.handleFailover(removed)
+			}
+
+			c.rebalancePartitions()
+		}
 	}
 }
 
@@ -155,6 +203,9 @@ func (c *Controller) handleFailover(unhealthyNodeIDs []string) {
 
 		if model.ContainsString(unhealthyNodeIDs, partition.LeaderID) {
 			partition.LeaderID = ""
+		}
+		if c.registry != nil {
+			c.registry.PutPartition(context.Background(), *partition)
 		}
 	}
 	c.mu.Unlock()
@@ -211,6 +262,9 @@ func (c *Controller) rebalancePartitions() {
 				neededFollowers--
 				c.mu.Lock()
 				c.partitions[partition.ID].FollowerIDs = append(c.partitions[partition.ID].FollowerIDs, node.ID)
+				if c.registry != nil {
+					c.registry.PutPartition(context.Background(), *c.partitions[partition.ID])
+				}
 				c.mu.Unlock()
 
 				log.Printf("Rebalance: Assigned follower for partition %d to node %s", partition.ID, node.ID)
@@ -231,6 +285,9 @@ func (c *Controller) rebalancePartitions() {
 
 			c.mu.Lock()
 			c.partitions[partition.ID].FollowerIDs = c.partitions[partition.ID].FollowerIDs[:desiredFollowers]
+			if c.registry != nil {
+				c.registry.PutPartition(context.Background(), *c.partitions[partition.ID])
+			}
 			c.mu.Unlock()
 		}
 
@@ -253,6 +310,9 @@ func (c *Controller) rebalancePartitions() {
 			c.mu.Lock()
 			c.partitions[partition.ID].LeaderID = newLeaderID
 			c.partitions[partition.ID].FollowerIDs = updatedFollowers
+			if c.registry != nil {
+				c.registry.PutPartition(context.Background(), *c.partitions[partition.ID])
+			}
 			c.mu.Unlock()
 
 			// Notify the new leader node
@@ -564,4 +624,39 @@ func (c *Controller) getPartition(partitionID int) (model.Partition, bool) {
 
 	partition, exists := c.partitions[partitionID]
 	return *partition, exists
+}
+
+// leaderElection performs leader election using etcd. When this controller wins
+// the election it runs heartbeat monitoring until leadership is lost.
+func (c *Controller) leaderElection() {
+	for {
+		sess, err := concurrency.NewSession(c.registry.Client(), concurrency.WithTTL(5))
+		if err != nil {
+			log.Printf("leader election session error: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		elect := concurrency.NewElection(sess, "controller-election")
+		ctx := context.Background()
+		if err := elect.Campaign(ctx, c.id); err != nil {
+			log.Printf("election campaign error: %v", err)
+			sess.Close()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		log.Printf("Controller %s became leader", c.id)
+		lctx, cancel := context.WithCancel(context.Background())
+		c.leaderCancel = cancel
+		c.isLeader = true
+
+		c.initializePartitions()
+		go c.checkHeartbeats(lctx)
+
+		<-sess.Done()
+		cancel()
+		c.isLeader = false
+		log.Printf("Controller %s lost leadership", c.id)
+		sess.Close()
+	}
 }

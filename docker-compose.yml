@@ -1,62 +1,104 @@
+version: '3.8'
 services:
-  controller:
-    build: .
+  etcd:
+    image: quay.io/coreos/etcd:v3.5
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://0.0.0.0:2379
     ports:
-      - "8080:8080"
-    command: ./controller
+      - "2379:2379"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2379/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - sliceDB-network
+
+  controller1:
+    build: .
+    command: ["./controller", "--id", "controller1", "--addr", ":8080", "--etcd", "etcd:2379"]
+    depends_on:
+      etcd:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: always
+    ports:
+      - "8080:8080"
+    networks:
+      - sliceDB-network
+
+  controller2:
+    build: .
+    command: ["./controller", "--id", "controller2", "--addr", ":8084", "--etcd", "etcd:2379"]
+    depends_on:
+      etcd:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8084/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: always
+    ports:
+      - "8084:8084"
     networks:
       - sliceDB-network
 
   node1:
     build: .
-    ports:
-      - "8081:8081"
-    command: ["./node", "--id", "node1", "--addr", ":8081", "--controller", "controller:8080"]
+    command: ["./node", "--id", "node1", "--addr", ":8081", "--etcd", "etcd:2379"]
     depends_on:
-      controller:
-        condition: service_healthy
+      etcd:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: always
+    ports:
+      - "8081:8081"
     networks:
       - sliceDB-network
 
   node2:
     build: .
-    ports:
-      - "8082:8082"
-    command: ["./node", "--id", "node2", "--addr", ":8082",  "--controller", "controller:8080"]
+    command: ["./node", "--id", "node2", "--addr", ":8082", "--etcd", "etcd:2379"]
     depends_on:
-      controller:
-        condition: service_healthy
+      etcd:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: always
+    ports:
+      - "8082:8082"
     networks:
       - sliceDB-network
 
   node3:
     build: .
-    ports:
-      - "8083:8083"
-    command: ["./node", "--id", "node3", "--addr", ":8083",  "--controller", "controller:8080"]
+    command: ["./node", "--id", "node3", "--addr", ":8083", "--etcd", "etcd:2379"]
     depends_on:
-      controller:
-        condition: service_healthy
+      etcd:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8083/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: always
+    ports:
+      - "8083:8083"
     networks:
       - sliceDB-network
 

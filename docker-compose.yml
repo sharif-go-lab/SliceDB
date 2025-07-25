@@ -1,9 +1,45 @@
 services:
-  etcd:
+  etcd1:
     image: quay.io/coreos/etcd:v3.5.10
     ports:
       - "2379:2379"
-    command: [ "etcd", "--advertise-client-urls", "http://0.0.0.0:2379", "--listen-client-urls", "http://0.0.0.0:2379" ]
+    environment:
+      - ETCD_NAME=etcd1
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd1:2380
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd1:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_INITIAL_CLUSTER=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=slicedb-cluster
+    networks:
+      - sliceDB-network
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.10
+    environment:
+      - ETCD_NAME=etcd2
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd2:2380
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd2:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_INITIAL_CLUSTER=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=slicedb-cluster
+    networks:
+      - sliceDB-network
+
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.10
+    environment:
+      - ETCD_NAME=etcd3
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd3:2380
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd3:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_INITIAL_CLUSTER=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=slicedb-cluster
     networks:
       - sliceDB-network
 
@@ -11,9 +47,13 @@ services:
     build: .
     ports:
       - "8080:8080"
-    command: ["./controller", "--etcd", "etcd:2379"]
+    command: ["./controller", "--etcd", "etcd1:2379,etcd2:2379,etcd3:2379"]
     depends_on:
-      etcd:
+      etcd1:
+        condition: service_started
+      etcd2:
+        condition: service_started
+      etcd3:
         condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -27,7 +67,7 @@ services:
     build: .
     ports:
       - "8081:8081"
-    command: ["./node", "--id", "node1", "--addr", ":8081", "--etcd", "etcd:2379"]
+    command: ["./node", "--id", "node1", "--addr", ":8081", "--etcd", "etcd1:2379,etcd2:2379,etcd3:2379"]
     depends_on:
       controller:
         condition: service_healthy
@@ -43,7 +83,7 @@ services:
     build: .
     ports:
       - "8082:8082"
-    command: ["./node", "--id", "node2", "--addr", ":8082", "--etcd", "etcd:2379"]
+    command: ["./node", "--id", "node2", "--addr", ":8082", "--etcd", "etcd1:2379,etcd2:2379,etcd3:2379"]
     depends_on:
       controller:
         condition: service_healthy
@@ -59,7 +99,7 @@ services:
     build: .
     ports:
       - "8083:8083"
-    command: ["./node", "--id", "node3", "--addr", ":8083", "--etcd", "etcd:2379"]
+    command: ["./node", "--id", "node3", "--addr", ":8083", "--etcd", "etcd1:2379,etcd2:2379,etcd3:2379"]
     depends_on:
       controller:
         condition: service_healthy

@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SliceDB Control Panel</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+    --accent: #2f6fde; --ok: #1f9d55; --warn: #c27c0e; --bad: #d64545; --chip: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171d; --panel: #1c2028; --text: #e6e9ef; --muted: #99a1b3; --line: #2c323d;
+            --accent: #6d9cff; --ok: #3ccf7f; --warn: #f0b243; --bad: #ff6b6b; --chip: #262c37; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0 8px 0 0; }
+  main { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; overflow-x: auto; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--chip); margin: 1px 3px 1px 0; font-size: 12px; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .muted { color: var(--muted); }
+  .lead { font-weight: 600; }
+  button { font: inherit; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--chip); color: var(--text); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.small { padding: 0 6px; font-size: 11px; margin-left: 2px; }
+  input, select { font: inherit; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  input[type=number] { width: 80px; }
+  form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; }
+  .bar { height: 8px; background: var(--chip); border-radius: 4px; overflow: hidden; margin-top: 6px; }
+  .bar > div { height: 100%; background: var(--accent); }
+  #events { max-height: 320px; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  #events div { padding: 2px 0; border-bottom: 1px dashed var(--line); white-space: pre-wrap; }
+  #toast { position: fixed; right: 16px; bottom: 16px; max-width: 420px; padding: 10px 14px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SliceDB</h1>
+  <span id="who" class="chip"></span>
+  <span id="leader" class="chip"></span>
+  <span id="health" class="chip"></span>
+</header>
+<main>
+  <div class="grid">
+    <section>
+      <h2>Cluster configuration</h2>
+      <div class="kv" id="summary"></div>
+      <form id="cfg">
+        <label>Partitions <input type="number" min="1" max="1024" name="partition_count"></label>
+        <label>Replication factor <input type="number" min="1" max="16" name="replication_factor"></label>
+        <button>Apply</button>
+      </form>
+      <div id="reshard"></div>
+    </section>
+    <section>
+      <h2>Controllers <span class="muted">(etcd election)</span></h2>
+      <table id="controllers"></table>
+    </section>
+  </div>
+
+  <section>
+    <h2>Nodes <span class="muted">(membership = etcd leases; start a node container to add it, drain to remove it)</span></h2>
+    <table id="nodes"></table>
+  </section>
+
+  <section>
+    <h2>Partitions</h2>
+    <form id="move">
+      Move replica of partition
+      <select name="partition"></select>
+      from <select name="from"></select>
+      to <select name="to"></select>
+      <button>Move</button>
+      <span class="muted">· click ⇪ next to a follower to make it the leader</span>
+    </form>
+    <table id="parts"></table>
+  </section>
+
+  <section>
+    <h2>Events <span class="muted">(from the leader controller)</span></h2>
+    <div id="events"></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let state = null;
+let cfgTouched = false;
+
+async function api(path, body) {
+  const opts = body ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {};
+  const r = await fetch(path, opts);
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = {error: text}; }
+  if (!r.ok && !(path === '/api/state' && data)) throw new Error((data && data.error) || r.statusText);
+  return data;
+}
+
+function toast(msg, bad) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  t.style.borderColor = bad ? 'var(--bad)' : 'var(--ok)';
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.style.display = 'none', 4000);
+}
+
+async function act(path, body, okMsg) {
+  try { await api(path, body); toast(okMsg); refresh(); }
+  catch (e) { toast(e.message, true); }
+}
+
+function statusOf(node, gen, id) {
+  const st = state.status && state.status[node];
+  if (!st || !st.partitions) return null;
+  return st.partitions.find(p => p.generation === gen && p.id === id) || null;
+}
+
+function partitionRows(list, gen, migration) {
+  return list.map(p => {
+    const ls = statusOf(p.leader, gen, p.id);
+    const follower = f => {
+      const s = statusOf(f, gen, p.id);
+      const lag = s && ls ? ls.seq - s.seq : null;
+      const btn = gen === state.layout.generation && p.state !== 'handoff'
+        ? `<button class="small" title="make leader" onclick="makeLeader(${gen},${p.id},'${esc(f)}')">⇪</button>` : '';
+      return `<span class="chip">${esc(f)}${lag !== null ? ` <span class="muted">lag ${lag}</span>` : ''}${btn}</span>`;
+    };
+    const chips = (xs, cls) => (xs || []).map(x => `<span class="chip ${cls}">${esc(x)}</span>`).join('');
+    const pin = p.pinned ? ` <span class="chip" title="placed by hand; the auto-balancer skips it">pinned<button class="small" onclick="unpin(${gen},${p.id})">unpin</button></span>` : '';
+    const stateCell = (p.state === 'handoff'
+      ? `<span class="warn">handoff → ${esc(p.handoff_to)}</span>` : `<span class="ok">active</span>`) + pin;
+    const mig = migration ? `<td>${migration[p.id] === 'done' ? '<span class="ok">done</span>' : '<span class="warn">pending</span>'}</td>` : '';
+    return `<tr>
+      <td>g${gen}/p${p.id}</td><td>${stateCell}</td><td>${p.epoch}</td>
+      <td class="lead">${p.leader ? esc(p.leader) : '<span class="bad">none</span>'}</td>
+      <td>${ls ? ls.keys : ''}</td><td>${ls ? ls.seq : ''}</td>
+      <td>${ls ? `${ls.memtable} / ${ls.levels}` : ''}</td>
+      <td>${(p.followers || []).map(follower).join('')}</td>
+      <td>${chips(p.joining, 'warn')}</td><td>${chips(p.evict, 'bad')}</td>${mig}
+    </tr>`;
+  }).join('');
+}
+
+function render() {
+  const s = state, l = s.layout;
+  $('#who').textContent = `served by ${s.controller}${s.leading ? ' (leader)' : ''}`;
+  $('#leader').textContent = `leader: ${s.leader || 'none'}`;
+  $('#health').innerHTML = s.unstable_reason ? `<span class="warn">converging: ${esc(s.unstable_reason)}</span>` : '<span class="ok">stable</span>';
+
+  $('#summary').innerHTML = `
+    <span class="muted">Desired</span><span>${s.config.partition_count} partitions × ${s.config.replication_factor} copies</span>
+    <span class="muted">Layout</span><span>${l ? `v${l.version}, generation ${l.generation}, ${l.partition_count} partitions` : 'none yet'}</span>
+    <span class="muted">Nodes</span><span>${(s.nodes || []).length} registered</span>`;
+  if (!cfgTouched) {
+    $('#cfg').partition_count.value = s.config.partition_count;
+    $('#cfg').replication_factor.value = s.config.replication_factor;
+  }
+
+  $('#controllers').innerHTML = '<tr><th>ID</th><th>Address</th><th>Role</th></tr>' +
+    (s.controllers || []).map(c => `<tr><td>${esc(c.id)}</td><td>${esc(c.address)}</td>
+      <td>${c.address === s.leader ? '<span class="ok lead">leader</span>' : '<span class="muted">standby</span>'}</td></tr>`).join('');
+
+  const counts = {};
+  if (l) {
+    const each = (list, gen) => list.forEach(p => {
+      if (p.leader) (counts[p.leader] ||= {lead: 0, rep: 0}).lead++;
+      [...(p.followers || []), ...(p.joining || [])].forEach(f => (counts[f] ||= {lead: 0, rep: 0}).rep++);
+    });
+    each(l.partitions, l.generation);
+    if (l.resharding) each(l.resharding.partitions, l.resharding.generation);
+  }
+  $('#nodes').innerHTML = '<tr><th>Node</th><th>Address</th><th>State</th><th>Leads</th><th>Replicas</th><th>Keys led</th><th>set / get / del</th><th></th></tr>' +
+    (s.nodes || []).map(n => {
+      const st = s.status && s.status[n.id];
+      const drained = s.drained && s.drained[n.id];
+      const member = l && l.members && l.members[n.id] === n.incarnation;
+      const keys = st && st.partitions ? st.partitions.filter(p => p.role === 'leader').reduce((a, p) => a + p.keys, 0) : '';
+      const ops = st && st.ops ? `${st.ops.set || 0} / ${st.ops.get || 0} / ${st.ops.delete || 0}` : '';
+      const label = drained ? '<span class="warn">draining</span>' : !member ? '<span class="warn">joining</span>' : st ? '<span class="ok">up</span>' : '<span class="bad">no status</span>';
+      const c = counts[n.id] || {lead: 0, rep: 0};
+      return `<tr><td class="lead">${esc(n.id)}</td><td>${esc(n.address)}</td><td>${label}</td><td>${c.lead}</td><td>${c.rep}</td><td>${keys}</td><td>${ops}</td>
+        <td><button onclick="drain('${esc(n.id)}', ${!drained})">${drained ? 'Undrain' : 'Drain'}</button></td></tr>`;
+    }).join('');
+
+  const head = mig => `<tr><th>Partition</th><th>State</th><th>Epoch</th><th>Leader</th><th>Keys</th><th>Seq</th><th>Mem / levels</th><th>In-sync followers</th><th>Joining</th><th>Evicting</th>${mig ? '<th>Migration</th>' : ''}</tr>`;
+  let html = '';
+  if (l) {
+    html += head(false) + partitionRows(l.partitions, l.generation, null);
+    if (l.resharding) {
+      html += `<tr><td colspan="11"><b>Next generation (${l.resharding.partition_count} partitions)</b></td></tr>` +
+        head(true) + partitionRows(l.resharding.partitions, l.resharding.generation, l.resharding.status);
+    }
+  }
+  $('#parts').innerHTML = html;
+
+  if (l && l.resharding) {
+    const done = l.resharding.status.filter(x => x === 'done').length;
+    const total = l.resharding.status.length;
+    $('#reshard').innerHTML = `<div>Resharding ${l.partition_count} → ${l.resharding.partition_count}: ${done}/${total} partitions migrated</div>
+      <div class="bar"><div style="width:${100 * done / total}%"></div></div>`;
+  } else {
+    $('#reshard').innerHTML = '';
+  }
+
+  const mv = $('#move');
+  const keep = {partition: mv.partition.value, from: mv.from.value, to: mv.to.value};
+  if (l) {
+    mv.partition.innerHTML = l.partitions.map(p => `<option value="${p.id}">g${l.generation}/p${p.id}</option>`).join('');
+    const sel = l.partitions.find(p => String(p.id) === keep.partition) || l.partitions[0];
+    if (sel) {
+      mv.partition.value = sel.id;
+      const holders = [sel.leader, ...(sel.followers || []), ...(sel.joining || [])].filter(Boolean);
+      mv.from.innerHTML = holders.map(h => `<option>${esc(h)}</option>`).join('');
+      mv.to.innerHTML = (s.nodes || []).filter(n => !holders.includes(n.id)).map(n => `<option>${esc(n.id)}</option>`).join('');
+      if (holders.includes(keep.from)) mv.from.value = keep.from;
+      if ([...mv.to.options].some(o => o.value === keep.to)) mv.to.value = keep.to;
+    }
+  }
+
+  $('#events').innerHTML = (s.events || []).slice().reverse()
+    .map(e => `<div><span class="muted">${new Date(e.time).toLocaleTimeString()}</span> ${esc(e.message)}</div>`).join('') || '<span class="muted">no events yet</span>';
+}
+
+async function refresh() {
+  try { state = await api('/api/state'); render(); }
+  catch (e) { $('#health').innerHTML = `<span class="bad">controller unreachable: ${esc(e.message)}</span>`; }
+}
+
+function makeLeader(gen, id, node) {
+  act('/api/partitions/leader', {generation: gen, partition: id, node}, `handing g${gen}/p${id} to ${node}`);
+}
+function unpin(gen, id) {
+  act('/api/partitions/unpin', {generation: gen, partition: id}, `g${gen}/p${id} unpinned`);
+}
+function drain(node, drained) {
+  act('/api/nodes/drain', {node, drained}, drained ? `draining ${node}` : `${node} undrained`);
+}
+
+$('#cfg').addEventListener('input', () => cfgTouched = true);
+$('#cfg').addEventListener('submit', e => {
+  e.preventDefault();
+  const f = e.target;
+  cfgTouched = false;
+  act('/api/config', {partition_count: +f.partition_count.value, replication_factor: +f.replication_factor.value}, 'config updated');
+});
+$('#move').partition.addEventListener('change', render);
+$('#move').addEventListener('submit', e => {
+  e.preventDefault();
+  const f = e.target;
+  act('/api/partitions/move', {partition: +f.partition.value, from: f.from.value, to: f.to.value}, 'replica move scheduled');
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

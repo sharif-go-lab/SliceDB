@@ -1,75 +1,167 @@
-services:
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.10
-    ports:
-      - "2379:2379"
-    command: [ "etcd", "--advertise-client-urls", "http://0.0.0.0:2379", "--listen-client-urls", "http://0.0.0.0:2379" ]
-    networks:
-      - sliceDB-network
+# SliceDB: 3 etcd members, 3 controllers (one elected leader), database nodes, 2 load balancers.
+#
+#   docker compose up -d --build                      # etcd x3, controller x3, node1-3, lb1-2
+#   docker compose --profile extra up -d node4 node5  # add nodes (also works under load)
+#   docker compose run --rm client bench              # load test through both load balancers
+#
+# Panel: http://localhost:8080 (any of 8080-8082 works; followers forward to the leader)
+# Resource limits are configurable, e.g.  NODE_CPUS=0.5 NODE_MEMORY=128M docker compose up -d
 
-  controller:
-    build: .
-    ports:
-      - "8080:8080"
-    command: ["./controller", "--etcd", "etcd:2379"]
-    depends_on:
-      etcd:
-        condition: service_started
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
-    networks:
-      - sliceDB-network
+x-etcd: &etcd
+  image: quay.io/coreos/etcd:v3.5.10
+  networks: [sliceDB-network]
+  healthcheck:
+    test: ["CMD", "etcdctl", "endpoint", "health"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+
+x-slicedb: &slicedb
+  image: slicedb:local
+  build: .
+  networks: [sliceDB-network]
+  environment:
+    SLICEDB_ETCD: etcd1:2379,etcd2:2379,etcd3:2379
+  depends_on:
+    etcd1: { condition: service_healthy }
+    etcd2: { condition: service_healthy }
+    etcd3: { condition: service_healthy }
+
+x-controller: &controller
+  <<: *slicedb
+  deploy:
+    resources:
+      limits:
+        cpus: "${CONTROLLER_CPUS:-0.5}"
+        memory: "${CONTROLLER_MEMORY:-128M}"
+
+x-node: &node
+  <<: *slicedb
+  deploy:
+    resources:
+      limits:
+        cpus: "${NODE_CPUS:-1.0}"
+        memory: "${NODE_MEMORY:-512M}"
+
+x-lb: &lb
+  <<: *slicedb
+  deploy:
+    resources:
+      limits:
+        cpus: "${LB_CPUS:-1.0}"
+        memory: "${LB_MEMORY:-256M}"
+
+services:
+  etcd1:
+    <<: *etcd
+    ports: ["2379:2379"]
+    command:
+      - etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=slicedb-etcd
+
+  etcd2:
+    <<: *etcd
+    command:
+      - etcd
+      - --name=etcd2
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=slicedb-etcd
+
+  etcd3:
+    <<: *etcd
+    command:
+      - etcd
+      - --name=etcd3
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd3:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd3:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=slicedb-etcd
+
+  controller1:
+    <<: *controller
+    ports: ["8080:8080"]
+    command: ["./controller", "--id=controller1", "--addr=:8080", "--advertise=controller1:8080",
+              "--partitions=${PARTITIONS:-8}", "--replication=${REPLICATION:-2}"]
+
+  controller2:
+    <<: *controller
+    ports: ["8081:8080"]
+    command: ["./controller", "--id=controller2", "--addr=:8080", "--advertise=controller2:8080",
+              "--partitions=${PARTITIONS:-8}", "--replication=${REPLICATION:-2}"]
+
+  controller3:
+    <<: *controller
+    ports: ["8082:8080"]
+    command: ["./controller", "--id=controller3", "--addr=:8080", "--advertise=controller3:8080",
+              "--partitions=${PARTITIONS:-8}", "--replication=${REPLICATION:-2}"]
 
   node1:
-    build: .
-    ports:
-      - "8081:8081"
-    command: ["./node", "--id", "node1", "--addr", ":8081", "--etcd", "etcd:2379"]
-    depends_on:
-      controller:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
-    networks:
-      - sliceDB-network
+    <<: *node
+    ports: ["7001:7000"]
+    command: ["./node", "--id=node1", "--addr=:7000", "--advertise=node1:7000"]
 
   node2:
-    build: .
-    ports:
-      - "8082:8082"
-    command: ["./node", "--id", "node2", "--addr", ":8082", "--etcd", "etcd:2379"]
-    depends_on:
-      controller:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
-    networks:
-      - sliceDB-network
+    <<: *node
+    ports: ["7002:7000"]
+    command: ["./node", "--id=node2", "--addr=:7000", "--advertise=node2:7000"]
 
   node3:
-    build: .
-    ports:
-      - "8083:8083"
-    command: ["./node", "--id", "node3", "--addr", ":8083", "--etcd", "etcd:2379"]
-    depends_on:
-      controller:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8083/health"]
-      interval: 5s
-      timeout: 2s
-      retries: 5
-    networks:
-      - sliceDB-network
+    <<: *node
+    ports: ["7003:7000"]
+    command: ["./node", "--id=node3", "--addr=:7000", "--advertise=node3:7000"]
+
+  node4:
+    <<: *node
+    profiles: [extra]
+    ports: ["7004:7000"]
+    command: ["./node", "--id=node4", "--addr=:7000", "--advertise=node4:7000"]
+
+  node5:
+    <<: *node
+    profiles: [extra]
+    ports: ["7005:7000"]
+    command: ["./node", "--id=node5", "--addr=:7000", "--advertise=node5:7000"]
+
+  lb1:
+    <<: *lb
+    ports: ["9000:9000"]
+    command: ["./loadbalancer", "--addr=:9000", "--read-strategy=${READ_STRATEGY:-round-robin}"]
+
+  lb2:
+    <<: *lb
+    ports: ["9001:9000"]
+    command: ["./loadbalancer", "--addr=:9000", "--read-strategy=${READ_STRATEGY:-round-robin}"]
+
+  client:
+    <<: *slicedb
+    profiles: [tools]
+    entrypoint: ["./client"]
+    command: ["--help"]
+    environment:
+      SLICEDB_LB: http://lb1:9000,http://lb2:9000
+    deploy:
+      resources:
+        limits:
+          cpus: "${CLIENT_CPUS:-2.0}"
+          memory: "${CLIENT_MEMORY:-256M}"
 
 networks:
   sliceDB-network:

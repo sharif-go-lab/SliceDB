@@ -416,10 +416,19 @@ func (p *planner) startResharding() {
 		Partitions:     make([]model.Partition, target),
 		Status:         make([]model.MigrationStatus, target),
 	}
+	leaders := make(map[string]int)
 	for i := range r.Partitions {
 		part := &r.Partitions[i]
 		*part = model.Partition{ID: i, Epoch: 1, State: model.PartitionActive}
-		part.Leader = p.leastLoaded(part)
+		// Spread leaderships evenly up front; picking by total load alone keeps choosing the same
+		// nodes as leaders and leaves the balancer a long series of handoffs afterwards.
+		for _, id := range p.eligible {
+			if part.Leader == "" || leaders[id] < leaders[part.Leader] ||
+				(leaders[id] == leaders[part.Leader] && p.load[id] < p.load[part.Leader]) {
+				part.Leader = id
+			}
+		}
+		leaders[part.Leader]++
 		p.load[part.Leader]++
 		for len(part.Joining)+1 < copies {
 			n := p.leastLoaded(part)

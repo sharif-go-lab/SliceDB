@@ -239,10 +239,15 @@ func TestReshardingStartsNextGeneration(t *testing.T) {
 	if r == nil || r.PartitionCount != 8 || r.Generation != c.layout.Generation+1 {
 		t.Fatalf("resharding not started: %+v", r)
 	}
+	leaders := map[string]int{}
 	for i, p := range r.Partitions {
 		if p.Leader == "" || r.Status[i] != model.MigrationPending {
 			t.Fatalf("new partition %d not prepared: %+v", i, p)
 		}
+		leaders[p.Leader]++
+	}
+	if len(leaders) != 3 || spread(leaders) > 1 {
+		t.Fatalf("new generation's leaders are not spread evenly: %v", leaders)
 	}
 	// Until a partition is migrated, its keys still route to the old generation.
 	for i := 0; i < 100; i++ {

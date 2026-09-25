@@ -17,6 +17,8 @@ $ client bench -duration 16s -concurrency 16 -reads 0.5          # node1 is kill
 total: 369795 ok, 0 errors, 16 client retries in 16.004s
 ```
 
+![SliceDB control panel showing the cluster configuration, three controllers with the elected leader, and four balanced nodes under load](docs/screenshots/overview.png)
+
 ## Features
 
 - Hash partitioning with `fnv32a(key) % partitions` and a configurable replication factor.
@@ -116,6 +118,10 @@ From the panel you can:
 | Make a follower the leader (⇪) | Graceful handoff. The partition is then pinned so the auto-balancer won't undo it. |
 
 The same operations are available through the admin API (see [HTTP API](#http-api)).
+
+![Partitions table with leaders, WAL positions, LSM levels, in-sync followers and a pinned partition, above the event log of a leadership handoff and a reshard from 16 to 12 partitions](docs/screenshots/partitions.png)
+
+The screenshots come from a local run, so addresses show as `127.0.0.1` ports instead of container names.
 
 ## How it works
 
